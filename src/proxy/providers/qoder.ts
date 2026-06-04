@@ -675,10 +675,12 @@ export class QoderProvider extends BaseProvider {
 
   private async ensureFreshAuth(tokens: QoderTokens): Promise<{ tokens: QoderTokens; refreshed: boolean }> {
     const now = Date.now();
+    // Refresh if token expires in less than 5 minutes (300 seconds)
+    // This prevents token expiry during long-running tasks
     const needsRefresh =
       !tokens.securityOauthToken ||
       !tokens.userId ||
-      (tokens.expireTime && tokens.expireTime - 60_000 < now);
+      (tokens.expireTime && tokens.expireTime - 300_000 < now);
 
     if (!needsRefresh) return { tokens, refreshed: false };
 
@@ -925,10 +927,14 @@ export class QoderProvider extends BaseProvider {
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
+          console.error(`[qoder-stream] Error during streaming: ${msg}`);
+          // Send error and finish reason to client
+          enqueue({}, "stop");
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: msg, type: "api_error" } })}\n\n`));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } finally {
-          controller.close();
           try { reader.releaseLock(); } catch {}
+          controller.close();
         }
       },
     });
