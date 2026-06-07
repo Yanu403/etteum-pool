@@ -14,6 +14,7 @@ import {
   Globe,
   Sparkles,
   Filter,
+  Plug,
   LogOut,
   X,
   Sun,
@@ -49,6 +50,7 @@ const navSections: NavSection[] = [
     title: "TOOLS",
     items: [
       { label: "Image Studio", path: "/image-studio", icon: Sparkles },
+      { label: "Integration", path: "/integration", icon: Plug },
     ],
   },
   {

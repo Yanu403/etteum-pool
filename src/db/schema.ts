@@ -165,6 +165,23 @@ export const proxyPool = sqliteTable("proxy_pool", {
   index("proxy_pool_status_idx").on(table.status),
 ]);
 
+// Model mappings for CLI integration (e.g. Claude Code). Incoming model ids are
+// rewritten at the proxy edge to a target model available in the pool. Example:
+// source "haiku" (match_type=contains) -> target "qwen-3.7".
+export const modelMappings = sqliteTable("model_mappings", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  sourcePattern: text("source_pattern").notNull(), // e.g. "haiku" / "claude-3-5-sonnet" / regex
+  matchType: text("match_type").notNull().default("contains"), // contains | exact | regex
+  targetModel: text("target_model").notNull().default(""), // model id available in the pool
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  priority: integer("priority").notNull().default(0), // lower = evaluated first
+  label: text("label"), // optional human label e.g. "Claude Code · Haiku"
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => [
+  index("model_mappings_priority_idx").on(table.priority),
+]);
+
 // Type exports
 export type Account = typeof accounts.$inferSelect;
 export type NewAccount = typeof accounts.$inferInsert;
@@ -185,3 +202,5 @@ export type ImageStudioResult = typeof imageStudioResults.$inferSelect;
 export type NewImageStudioResult = typeof imageStudioResults.$inferInsert;
 export type FilterRule = typeof filterRules.$inferSelect;
 export type NewFilterRule = typeof filterRules.$inferInsert;
+export type ModelMapping = typeof modelMappings.$inferSelect;
+export type NewModelMapping = typeof modelMappings.$inferInsert;

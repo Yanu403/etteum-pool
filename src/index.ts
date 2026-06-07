@@ -14,6 +14,7 @@ import { filterRules } from "./db/schema";
 import { sql } from "drizzle-orm";
 import { PUDIDIL_FILTERS } from "./proxy/filters";
 import { loadFilterCache } from "./proxy/filter-cache";
+import { ensureModelMappingTable, seedModelMappings, loadModelMappingCache } from "./proxy/model-mapping";
 
 // Run database migrations on startup
 await runMigrations();
@@ -37,6 +38,16 @@ try {
   await loadFilterCache();
 } catch (e) {
   console.error("[DB] Filter rules seed/load skipped:", e instanceof Error ? e.message : e);
+}
+
+// Ensure model_mappings table exists (idempotent), seed Claude Code templates
+// on first boot, then load the in-memory cache used by the proxy hot path.
+try {
+  ensureModelMappingTable();
+  await seedModelMappings();
+  await loadModelMappingCache();
+} catch (e) {
+  console.error("[DB] Model mapping init skipped:", e instanceof Error ? e.message : e);
 }
 
 // Start auto-warmup scheduler (reads settings from DB)

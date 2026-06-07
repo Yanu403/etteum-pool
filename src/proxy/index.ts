@@ -13,6 +13,7 @@ import {
 } from "./transforms/anthropic";
 import { isBadUpstreamRequest, isInvalidModelError } from "./errors";
 import { prepareLogBody } from "./logging";
+import { resolveModelAlias } from "./model-mapping";
 import { eq, sql } from "drizzle-orm";
 import { providerList } from "./providers/registry";
 
@@ -451,7 +452,9 @@ function wrapStreamWithUsageFinalizer(
 }
 
 async function handleChatCompletion(body: ChatCompletionRequest) {
-  body = { ...body, model: normalizeModelId(body.model) };
+  // Rewrite the incoming model id to its mapped target (CLI integration, e.g.
+  // Claude Code's hardcoded haiku/sonnet/opus ids -> a model in the pool).
+  body = { ...body, model: resolveModelAlias(normalizeModelId(body.model)) };
   const isStream = body.stream === true;
   const { result, account, provider, durationMs } = await routeRequest(body, isStream);
   let shouldReleaseTracking = true;
@@ -636,7 +639,7 @@ proxyRouter.post("/v1/chat/completions", async (c) => {
       error instanceof Error ? error.message : String(error);
 
     // Log the error without masking the original proxy failure.
-    const provider = pool.getProviderForModel(normalizeModelId(body.model)) || "unknown";
+    const provider = pool.getProviderForModel(resolveModelAlias(normalizeModelId(body.model))) || "unknown";
     await logProxyError({
       provider,
       model: body.model,
@@ -710,7 +713,7 @@ proxyRouter.post("/v1/messages", async (c) => {
     return c.json(openAIToAnthropic(result.response, body));
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const provider = pool.getProviderForModel(normalizeModelId(body.model)) || "unknown";
+    const provider = pool.getProviderForModel(resolveModelAlias(normalizeModelId(body.model))) || "unknown";
     await logProxyError({
       provider,
       model: body.model,

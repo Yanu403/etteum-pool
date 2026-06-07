@@ -8,6 +8,7 @@ import { proxyPoolRouter } from "./proxy-pool";
 import { imageStudioRouter } from "./image-studio";
 import { filtersRouter } from "./filters";
 import { binApi } from "./bin";
+import { integrationRouter } from "./integration";
 
 export const apiRouter = new Hono();
 
@@ -20,6 +21,7 @@ apiRouter.route("/proxy-pool", proxyPoolRouter);
 apiRouter.route("/image-studio", imageStudioRouter);
 apiRouter.route("/filters", filtersRouter);
 apiRouter.route("/bin", binApi);
+apiRouter.route("/integration", integrationRouter);
 
 apiRouter.get("/providers", (c) => {
   return c.json({ data: ["kiro", "kiro-pro", "codebuddy", "canva", "codex", "qoder"] });

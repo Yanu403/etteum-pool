@@ -204,6 +204,33 @@ export async function fetchModels() {
   return fetchApi("/v1/models");
 }
 
+export interface ModelMappingDTO {
+  id?: number;
+  sourcePattern: string;
+  matchType: string;
+  targetModel: string;
+  enabled: boolean;
+  priority: number;
+  label?: string | null;
+}
+
+export interface IntegrationData {
+  enabled: boolean;
+  mappings: ModelMappingDTO[];
+  models?: { id: string; owned_by: string }[];
+}
+
+export async function fetchIntegration(): Promise<IntegrationData> {
+  return fetchApi("/api/integration");
+}
+
+export async function saveIntegration(payload: { enabled?: boolean; mappings?: ModelMappingDTO[] }) {
+  return fetchApi("/api/integration", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function fetchSettings() {
   return fetchApi("/api/settings");
 }
