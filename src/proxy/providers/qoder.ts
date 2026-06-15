@@ -22,6 +22,9 @@ const SIG_SECRET = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw=="; // base64("war, war never
 const JOB_TOKEN_URL = "https://center.qoder.sh/algo/api/v3/user/jobToken?Encode=1";
 const USER_STATUS_URL = "https://center.qoder.sh/algo/api/v3/user/status?Encode=1";
 const QOTA_USAGE_URL = "https://openapi.qoder.sh/api/v2/quota/usage";
+// COSY-signed GET. Returns per-model promo "free quota" buckets (e.g. qmodel_latest 200/day),
+// distinct from QOTA_USAGE_URL which reports the account-wide credit balance.
+const ACTIVITY_URL = "https://openapi.qoder.sh/algo/api/v2/activity";
 
 export function openApiHeaders(securityOauthToken: string): Record<string, string> {
   return {
@@ -198,6 +201,44 @@ interface JobTokenResponse {
   userType?: string;
 }
 
+/**
+ * One row from `/algo/api/v2/activity`. Each row is a server-managed promo
+ * quota bucket scoped to one or more upstream model keys (e.g. `qmodel_latest`
+ * → qd-Qwen3.7-Max). Reset cadence and timezone are dictated by the server
+ * (`resetStrategy: DAY_EXPIRE`, `serverTimezone: Asia/Shanghai`).
+ */
+export interface QoderActivity {
+  type: string;              // e.g. "MODEL_FREE_QUOTA"
+  activityId: string;
+  modelName: string;
+  modelKeys: string[];       // upstream keys this quota applies to
+  limit: number;
+  used: number;
+  remaining: number;
+  resetAt: number;           // unix ms
+  resetStrategy: string;     // e.g. "DAY_EXPIRE"
+  serverTimezone: string;    // e.g. "Asia/Shanghai"
+  description?: string;
+  statusText?: string;
+  tag?: string;
+  tagStyle?: string;
+  eligible: boolean;
+  activityEndAt: number;     // unix ms — promo expiry
+  detailUrl?: string;
+}
+
+export interface QoderActivitySnapshot {
+  activities: QoderActivity[];
+  queryAt: number;           // unix ms reported by server
+  fetchedAt: string;         // ISO timestamp recorded locally
+}
+
+interface ActivityResponse {
+  code?: number;
+  msg?: string;
+  data?: { activities?: QoderActivity[]; queryAt?: number };
+}
+
 async function exchangeJobToken(tokens: QoderTokens): Promise<JobTokenResponse> {
   const inner = {
     personalToken: tokens.personalToken,
@@ -239,12 +280,16 @@ function buildIdentity(tokens: QoderTokens): AuthIdentity {
 
 interface BearerCallOptions {
   url: string;
-  body: unknown;
+  /** Pass `null`/`undefined` for GET-style calls with no body. */
+  body?: unknown;
+  /** Defaults to "POST". Use "GET" for query-only endpoints (e.g. /activity). */
+  method?: "GET" | "POST";
   extraHeaders?: Record<string, string>;
   stream?: boolean;
 }
 
 export async function bearerFetch(tokens: QoderTokens, opts: BearerCallOptions): Promise<Response> {
+  const method = opts.method || "POST";
   const session = buildSessionContext(buildIdentity(tokens));
   const bodyEncoded = opts.body == null ? "" : encodeQoderPayload(JSON.stringify(opts.body));
   const payloadB64 = buildPayloadB64(session.info);
@@ -254,7 +299,6 @@ export async function bearerFetch(tokens: QoderTokens, opts: BearerCallOptions):
 
   const headers: Record<string, string> = {
     "cosy-data-policy": "AGREE",
-    "content-type": "application/json",
     "cosy-machinetype": tokens.machineType,
     "cosy-clienttype": "5",
     "cosy-date": date,
@@ -273,11 +317,13 @@ export async function bearerFetch(tokens: QoderTokens, opts: BearerCallOptions):
     ...(opts.extraHeaders || {}),
   };
 
-  return fetch(opts.url, {
-    method: "POST",
-    headers,
-    body: bodyEncoded,
-  });
+  // content-type is meaningful only when there's a body to send.
+  const init: RequestInit = { method, headers };
+  if (method !== "GET") {
+    headers["content-type"] = "application/json";
+    init.body = bodyEncoded;
+  }
+  return fetch(opts.url, init);
 }
 
 // ============================================================================
@@ -428,10 +474,16 @@ ${toolDescriptions}
 
 Available tools: ${toolNames}`,
     });
-  } else if (!hasIncomingTools && !incomingHasSystem && Array.isArray(templateMessages)) {
-    for (const m of templateMessages) {
-      if (m && m.role === "system") result.push(m);
-    }
+  } else if (!hasIncomingTools && !incomingHasSystem) {
+    // Do NOT pull system messages from the Qoder-CLI template — they put
+    // the model in "Qoder CLI agent" mode (TodoWrite-everything, Windows
+    // hardcoded paths, "verify your output" loops, etc.) which causes
+    // off-topic repetition for plain chat. Add a neutral, minimal system
+    // prompt instead so the model just acts as a helpful assistant.
+    result.push({
+      role: "system",
+      content: "You are a helpful AI assistant. Answer the user's questions clearly and concisely. Maintain context from earlier turns in the conversation.",
+    });
   }
 
   for (const m of request.messages) {
@@ -538,31 +590,68 @@ Available tools: ${toolNames}`,
 }
 
 /**
- * Derive a stable session_id from conversation messages.
- * Qoder server uses session_id as the key for server-side persisted conversation
- * state (context, tool call records, compaction boundaries). A random UUID per
- * request causes the server to treat every request as a brand-new conversation,
- * making the model "forget" prior context and repeat itself.
+ * Derive a stable session_id from a conversation's ANCHOR (the parts that
+ * don't change as the conversation grows).
  *
- * By hashing all message content into a deterministic UUID, the same
- * conversation always maps to the same session_id while different conversations
- * get different IDs.
+ * Qoder server uses session_id as the key for server-side persisted
+ * conversation state (context, tool call records, compaction boundaries).
+ * The session_id MUST stay constant across every turn of the same chat —
+ * otherwise the server treats each turn as a brand-new conversation, the
+ * model "forgets" prior context, and answers loop or repeat themselves.
+ *
+ * Bug we're fixing: the previous implementation hashed ALL messages, so
+ * every new turn (with one more message appended) produced a different
+ * session_id. Effectively: every turn = new session = no memory.
+ *
+ * Fix: hash only the conversation ANCHOR — everything that's stable across
+ * turns:
+ *   1. All system messages (system prompts don't change mid-conversation)
+ *   2. The FIRST user message (the conversation opener)
+ *
+ * The first user turn is the natural fingerprint of "which conversation
+ * is this." Two different chats almost never start with identical opener
+ * text, so collisions are rare; the same chat always rehashes to the same
+ * value because the anchor never changes.
  */
 function deriveSessionId(messages: ChatCompletionRequest["messages"]): string {
   const hash = crypto.createHash("sha256");
-  for (const msg of messages) {
-    hash.update(msg.role + ":");
-    if (typeof msg.content === "string") {
-      hash.update(msg.content);
-    } else if (Array.isArray(msg.content)) {
-      for (const block of msg.content as any[]) {
+  let firstUserSeen = false;
+
+  const updateWithContent = (content: unknown) => {
+    if (typeof content === "string") {
+      hash.update(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content as any[]) {
         if (block?.type === "text" && typeof block.text === "string") {
           hash.update(block.text);
         }
       }
     }
-    hash.update("\n");
+  };
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      hash.update("system:");
+      updateWithContent(msg.content);
+      hash.update("\n");
+    } else if (msg.role === "user" && !firstUserSeen) {
+      hash.update("user:");
+      updateWithContent(msg.content);
+      hash.update("\n");
+      firstUserSeen = true;
+      // Stop here — anything after the first user message is volatile
+      // (the assistant's reply, follow-up turns) and would destabilize
+      // the session_id as the conversation grows.
+      break;
+    }
   }
+
+  // Edge case: no user message yet (e.g. system-only probe). Fall back to
+  // hashing the role sequence so probes still get deterministic IDs.
+  if (!firstUserSeen) {
+    hash.update("__no_user__");
+  }
+
   const hex = hash.digest("hex").slice(0, 32);
   // Format as valid UUID v4
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
@@ -628,8 +717,16 @@ function buildChatBody(request: ChatCompletionRequest, tokens: QoderTokens): any
     body.parameters.max_tokens = request.max_tokens;
   }
 
+  // ALWAYS override `body.tools` from the request — never inherit the
+  // template's Qoder-CLI tool list (Bash/BashOutput/Edit/etc). If the
+  // client didn't send tools, send none. Inheriting template tools makes
+  // the model hallucinate tool calls the client cannot execute, which
+  // surfaces as repeated/looping responses (model keeps "trying" a tool
+  // that never returns a result).
   if (hasIncomingTools) {
     body.tools = request.tools;
+  } else {
+    body.tools = [];
   }
 
   return body;
@@ -1143,6 +1240,48 @@ export class QoderProvider extends BaseProvider {
     return !!t?.personalToken;
   }
 
+  /**
+   * Whether a given Qoder model id is covered by a Free-promo bucket on
+   * `/activity`. Currently only `qmodel_latest` (Qwen3.7-Max) has a promo;
+   * other models hit the account-wide credit pool from `/quota/usage`.
+   *
+   * Used by the proxy to route per-request decrement to the correct counter.
+   */
+  isFreeModel(modelId: string): boolean {
+    const def = MODEL_CONFIGS[modelId];
+    return def?.upstream === "qmodel_latest";
+  }
+
+  /**
+   * Verify whether a Qoder account is *actually* quota-exhausted by probing the
+   * cheapest model (`qd-Lite`, price_factor=0). Live request 403s are noisy:
+   * rate limits, signature replay, transient auth issues all surface as 403.
+   * Use this before flipping status to `exhausted` so we don't poison accounts
+   * that can still serve requests.
+   *
+   * Returns:
+   *   - true  → probe definitively says quota is exhausted (mark exhausted)
+   *   - false → probe succeeded or failed transiently (don't mark, retry later)
+   */
+  async probeQuotaExhausted(account: Account): Promise<boolean> {
+    try {
+      const probe = await this.chatCompletion(account, {
+        model: "qd-Lite",
+        messages: [{ role: "user", content: "OK" }],
+        max_tokens: 4,
+      });
+      // Probe succeeded → account is alive. Don't poison.
+      if (probe.success) return false;
+      // Probe explicitly says quota exhausted → trust it.
+      if (probe.quotaExhausted) return true;
+      // Anything else (transient, network, auth) — treat as inconclusive.
+      return false;
+    } catch {
+      // Throwing means we can't verify — be conservative, don't mark.
+      return false;
+    }
+  }
+
   async fetchQuota(account: Account): Promise<{ success: boolean; quota?: { limit: number; remaining: number; used: number; resetAt?: Date | string | null }; error?: string }> {
     const parsed = this.parseTokens(account);
     if (!parsed?.personalToken) return { success: false, error: "No personalToken" };
@@ -1182,18 +1321,57 @@ export class QoderProvider extends BaseProvider {
     }
   }
 
+  /**
+   * Fetch per-model promo quotas (e.g. Qwen3.7-Max 200/day) from
+   * `/algo/api/v2/activity`. COSY-signed GET — same auth as chat calls.
+   *
+   * Best-effort: callers should treat failures as non-fatal and fall back to
+   * the account-wide `quota/usage` data.
+   */
+  private async fetchActivityQuota(tokens: QoderTokens): Promise<QoderActivitySnapshot> {
+    const resp = await bearerFetch(tokens, { url: ACTIVITY_URL, method: "GET" });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`activity HTTP ${resp.status}: ${text.slice(0, 120)}`);
+    }
+    const data = (await resp.json()) as ActivityResponse;
+    if (data.code !== 0) {
+      throw new Error(`activity code=${data.code} msg=${data.msg ?? "unknown"}`);
+    }
+    return {
+      activities: Array.isArray(data.data?.activities) ? data.data!.activities! : [],
+      queryAt: Number(data.data?.queryAt ?? Date.now()),
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
   override async healthCheck(account: Account): Promise<ProviderHealthResult> {
     const parsed = this.parseTokens(account);
     if (!parsed?.personalToken) {
       return { kind: "missing_tokens", success: false, error: "No personalToken" };
     }
 
+    let tokens: QoderTokens;
+    let refreshed = false;
     try {
-      const { tokens, refreshed } = await this.ensureFreshAuth(parsed);
-      if (!tokens.securityOauthToken) {
-        return { kind: "session_expired", success: false, error: "No securityOauthToken after refresh" };
-      }
+      const auth = await this.ensureFreshAuth(parsed);
+      tokens = auth.tokens;
+      refreshed = auth.refreshed;
+    } catch (error) {
+      return {
+        kind: "transient_error",
+        success: false,
+        retryable: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (!tokens.securityOauthToken) {
+      return { kind: "session_expired", success: false, error: "No securityOauthToken after refresh" };
+    }
 
+    // ---- Account-wide credit (the "All" bar) ----
+    let result: ProviderHealthResult;
+    try {
       const resp = await fetch(QOTA_USAGE_URL, {
         method: "GET",
         headers: openApiHeaders(tokens.securityOauthToken),
@@ -1224,7 +1402,7 @@ export class QoderProvider extends BaseProvider {
       const exceeded = data.isQuotaExceeded === true || (remaining < 0) || (remaining <= 0 && limit > 0);
       const quota = { limit, remaining, used, resetAt, source: "qoder.openapi" };
 
-      return {
+      result = {
         kind: exceeded ? "exhausted" : "healthy",
         success: true,
         quota,
@@ -1238,6 +1416,23 @@ export class QoderProvider extends BaseProvider {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+
+    // ---- Per-model promo quota (the "Free" bar) — best-effort enrichment ----
+    // We deliberately swallow errors here: a flaky activity endpoint must not
+    // poison an otherwise-healthy account. Failures are recorded as a
+    // breadcrumb in metadata for observability.
+    try {
+      const activity = await this.fetchActivityQuota(tokens);
+      result.metadata = { ...(result.metadata || {}), activityQuota: activity };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      result.metadata = {
+        ...(result.metadata || {}),
+        activityQuotaError: msg.slice(0, 200),
+      };
+    }
+
+    return result;
   }
 }
 

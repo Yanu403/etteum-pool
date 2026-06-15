@@ -5,6 +5,7 @@ import { CanvaProvider } from "./canva";
 import { CodexProvider } from "./codex";
 import { QoderProvider } from "./qoder";
 import { ByokProvider } from "./byok";
+import { GitlabDuoProvider } from "./gitlab-duo";
 
 /**
  * Single source of truth for the provider set.
@@ -28,12 +29,15 @@ const canva = new CanvaProvider();
 const codex = new CodexProvider();
 const qoder = new QoderProvider();
 const byok = new ByokProvider();
+const gitlabDuo = new GitlabDuoProvider();
 
 // Priority order. canva/qoder/codex/kiro-pro have unique prefixes; codex is
 // listed before codebuddy so the literal "gpt-5-codex" resolves to codex while
 // codebuddy keeps its own "gpt-5*"/"gpt-5.x-codex" models. byok checks dynamic
-// prefixes from DB accounts. kiro is the fallback.
-const PROVIDER_ORDER = [canva, qoder, codex, kiroPro, byok, codebuddy, kiro] as const;
+// prefixes from DB accounts. kiro is the fallback. gitlab-duo owns
+// `claude_(haiku|sonnet|opus)_<digit>...` underscore-style identifiers — no
+// overlap with any other provider, so position is not load-bearing.
+const PROVIDER_ORDER = [gitlabDuo, canva, qoder, codex, kiroPro, byok, codebuddy, kiro] as const;
 
 export const providers = {
   kiro,
@@ -43,6 +47,7 @@ export const providers = {
   codex,
   qoder,
   byok,
+  "gitlab-duo": gitlabDuo,
 } as const;
 
 export type ProviderName = keyof typeof providers;
@@ -69,8 +74,18 @@ export async function refreshByokModels(): Promise<void> {
   await byok.refreshModelsCache();
 }
 
+/** Refresh GitLab Duo models from every active gitlab-duo account's metadata. */
+export async function refreshGitlabDuoModels(): Promise<void> {
+  await gitlabDuo.refreshModelsCache();
+}
+
 /** Get BYOK provider instance. */
 export function getByokProvider(): ByokProvider {
   return byok;
+}
+
+/** Get GitLab Duo provider instance. */
+export function getGitlabDuoProvider(): GitlabDuoProvider {
+  return gitlabDuo;
 }
 

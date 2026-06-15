@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { db } from "../db/index";
 import { accounts, requestLogs, vccCards, vccTransactions } from "../db/schema";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { encrypt, decrypt } from "../utils/crypto";
 import { broadcast } from "../ws/index";
 import type { NewAccount } from "../db/schema";
@@ -378,6 +378,491 @@ accountsRouter.post("/byok/:id/test", async (c) => {
     });
   }
 });
+/*  */
+/**
+ * ============================================================================
+ * GitLab Duo Management Endpoints
+ * NOTE: Must be defined BEFORE /:id routes to avoid route collision.
+ * ============================================================================
+ */
+
+/**
+ * Create a GitLab Duo account from a PAT — pure function, callable from both
+ * the HTTP route AND the bot runner (after Camoufox finishes the OAuth flow
+ * and obtains a fresh PAT). Performs PAT validation → namespace resolve →
+ * models lookup → row insert (or update of an existing pending row).
+ *
+ * Pass `existingAccountId` when called from the bot path to UPDATE the
+ * pending row created at queue time (preserves email + log history) instead
+ * of inserting a duplicate.
+ */
+export type CreateGitlabDuoInput = {
+  gitlabBaseUrl?: string;
+  pat: string;
+  label?: string;
+  existingAccountId?: number;
+  /**
+   * When set, the bot's original Gmail credentials are persisted alongside
+   * the PAT so future flows (re-login, trial extend) can re-use them.
+   */
+  gmailEmail?: string;
+  gmailPassword?: string;
+};
+
+export type CreateGitlabDuoOk = {
+  ok: true;
+  id: number;
+  label: string;
+  username: string;
+  namespacePath: string;
+  defaultModel: string;
+  modelsCount: number;
+};
+
+export type CreateGitlabDuoErr = {
+  ok: false;
+  status: number;
+  error: string;
+};
+
+export async function createGitlabDuoAccount(
+  input: CreateGitlabDuoInput
+): Promise<CreateGitlabDuoOk | CreateGitlabDuoErr> {
+  const baseUrl = (input.gitlabBaseUrl || "https://gitlab.com").replace(/\/$/, "");
+  const pat = input.pat?.trim();
+  if (!pat) return { ok: false, status: 400, error: "pat is required" };
+
+  // PAT auth — match the official duo-cli (which uses `Private-Token` for
+  // PAT and reserves `Authorization: Bearer …` for OAuth tokens).
+  const headers = {
+    "Private-Token": pat,
+    "Content-Type": "application/json",
+    "User-Agent": "etteum-pool/gitlab-duo",
+    "X-Gitlab-Client-Name": "Duo CLI",
+    "X-Gitlab-Client-Version": "8.104.0",
+  };
+
+  // 1. Validate PAT — must have `api` scope and not be revoked.
+  try {
+    const r = await fetch(`${baseUrl}/api/v4/personal_access_tokens/self`, { headers });
+    if (!r.ok) return { ok: false, status: 400, error: `PAT invalid (HTTP ${r.status})` };
+    const j = (await r.json()) as { scopes?: string[]; revoked?: boolean };
+    if (j.revoked) return { ok: false, status: 400, error: "PAT is revoked" };
+    if (!Array.isArray(j.scopes) || !j.scopes.includes("api")) {
+      return { ok: false, status: 400, error: "PAT must have `api` scope" };
+    }
+  } catch (e) {
+    return { ok: false, status: 502, error: `Cannot reach GitLab: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  // 2. Resolve user + duo-default namespace via GraphQL.
+  let username = "";
+  let userId = 0;
+  let namespacePath = "";
+  let namespaceId = 0;
+  try {
+    const gqlBody = {
+      operationName: "getUser",
+      query: `query getUser {
+        currentUser {
+          id
+          username
+          userPreferences { duoDefaultNamespace { id fullPath } }
+          groups(first: 1, permissionScope: CREATE_PROJECTS) {
+            nodes { id fullPath }
+          }
+        }
+      }`,
+      variables: {},
+    };
+    const r = await fetch(`${baseUrl}/api/graphql`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(gqlBody),
+    });
+    const json = (await r.json()) as any;
+    if (json.errors) return { ok: false, status: 400, error: `GraphQL: ${JSON.stringify(json.errors)}` };
+    const cu = json.data?.currentUser;
+    if (!cu) return { ok: false, status: 400, error: "currentUser is null — PAT lacks read_user scope?" };
+
+    const duoNs = cu.userPreferences?.duoDefaultNamespace;
+    const fallbackNs = cu.groups?.nodes?.[0];
+    const ns = duoNs ?? fallbackNs;
+    if (!ns) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Cannot resolve a namespace for this PAT. Either set a default namespace in GitLab → Preferences → Duo, or grant the user access to at least one group.",
+      };
+    }
+    username = cu.username;
+    userId = Number(String(cu.id).split("/").pop());
+    namespacePath = ns.fullPath;
+    namespaceId = Number(String(ns.id).split("/").pop());
+  } catch (e) {
+    return { ok: false, status: 502, error: `GraphQL fetch failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  // 3. List available models for that namespace.
+  let defaultModel = "claude_sonnet_4_6_vertex";
+  let availableModels: Array<{ name: string; ref: string }> = [];
+  let gitlabVersion = "";
+  try {
+    const gqlBody = {
+      operationName: "lsp_aiChatAvailableModels",
+      query: `query lsp_aiChatAvailableModels($rootNamespaceId: GroupID!) {
+        metadata { version }
+        aiChatAvailableModels(rootNamespaceId: $rootNamespaceId) {
+          defaultModel { name ref }
+          selectableModels { name ref }
+        }
+      }`,
+      variables: { rootNamespaceId: `gid://gitlab/Group/${namespaceId}` },
+    };
+    const r = await fetch(`${baseUrl}/api/graphql`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(gqlBody),
+    });
+    const json = (await r.json()) as any;
+    gitlabVersion = json.data?.metadata?.version ?? "";
+    const dm = json.data?.aiChatAvailableModels?.defaultModel;
+    const sm = json.data?.aiChatAvailableModels?.selectableModels;
+    if (dm?.ref) defaultModel = dm.ref;
+    if (Array.isArray(sm)) availableModels = sm;
+  } catch {
+    // Non-fatal — fall back to bundled defaults.
+  }
+
+  const label = input.label?.trim() || username;
+  const tokens = {
+    gitlabBaseUrl: baseUrl,
+    namespaceId,
+    namespacePath,
+    userId,
+    ...(input.gmailEmail ? { gmailEmail: input.gmailEmail } : {}),
+  };
+  const metadata: Record<string, unknown> = {
+    defaultModel,
+    availableModels,
+    gitlabVersion,
+  };
+  if (input.gmailPassword) {
+    // Encrypt the Gmail password again under metadata so it survives PAT
+    // rotation without leaking outside `password` (which holds the PAT).
+    metadata.gmailPasswordEncrypted = encrypt(input.gmailPassword);
+  }
+
+  // 3.5. Pull live GitLab Credits (trial wallet) — every trial seat gets
+  // ~24 credits over the 30-day window. We hit `trialUsage.usersUsage.users`
+  // and pick the row matching our user's gid; falls back to the first node.
+  let quotaLimit = 0;
+  let quotaRemaining = 0;
+  let quotaResetAt: Date | null = null;
+  try {
+    const r = await fetch(`${baseUrl}/api/graphql`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        operationName: "getTrialUsage",
+        query: `query getTrialUsage($namespacePath: ID) {
+          trialUsage(namespacePath: $namespacePath) {
+            activeTrial { startDate endDate }
+            usersUsage {
+              users(first: 50) {
+                nodes { id username usage { creditsUsed totalCredits } }
+              }
+            }
+          }
+        }`,
+        variables: { namespacePath },
+      }),
+    });
+    if (r.ok) {
+      const j = (await r.json()) as any;
+      const trial = j?.data?.trialUsage;
+      const nodes: Array<{ id?: string; username?: string; usage?: { creditsUsed?: number; totalCredits?: number } }> =
+        trial?.usersUsage?.users?.nodes ?? [];
+      const ourGid = userId ? `gid://gitlab/User/${userId}` : null;
+      const me =
+        nodes.find((n) => ourGid && n.id === ourGid) ??
+        nodes.find((n) => n.username && username && n.username.toLowerCase() === username.toLowerCase()) ??
+        nodes[0];
+      const used = me?.usage?.creditsUsed;
+      const total = me?.usage?.totalCredits;
+      if (typeof used === "number" && typeof total === "number") {
+        quotaLimit = total;
+        quotaRemaining = Math.max(0, total - used);
+      }
+      const endDate = trial?.activeTrial?.endDate ? new Date(trial.activeTrial.endDate) : null;
+      if (endDate && !isNaN(endDate.getTime())) quotaResetAt = endDate;
+    }
+  } catch {
+    // Non-fatal: leave quota at 0/0; the periodic warmup will fill it later.
+  }
+
+  // 4. Insert OR update existing pending row (bot path).
+  try {
+    if (input.existingAccountId) {
+      // Update path — bot already inserted a pending row at queue time. Same
+      // (provider, email) unique constraint already passed; just complete the
+      // row with real PAT/tokens/metadata.
+      const updated = await db.update(accounts)
+        .set({
+          password: encrypt(pat),
+          status: "active",
+          enabled: true,
+          tokens,
+          metadata,
+          quotaLimit,
+          quotaRemaining,
+          quotaResetAt,
+          errorMessage: null,
+          lastLoginAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(accounts.id, input.existingAccountId))
+        .returning();
+      const row = updated[0];
+      if (!row) return { ok: false, status: 404, error: "Pending account row not found" };
+      pool.invalidate("gitlab-duo" as ProviderName);
+      const { refreshGitlabDuoModels } = await import("../proxy/providers/registry");
+      await refreshGitlabDuoModels();
+      broadcast({
+        type: "account_updated",
+        data: { id: row.id, provider: "gitlab-duo", email: row.email, status: "active" },
+      });
+      return {
+        ok: true,
+        id: row.id,
+        label: row.email,
+        username,
+        namespacePath,
+        defaultModel,
+        modelsCount: availableModels.length,
+      };
+    }
+
+    // Standard insert path (manual PAT add via dashboard).
+    const existing = await db.select().from(accounts)
+      .where(eq(accounts.email, label))
+      .then((rows) => rows.find((r) => r.provider === "gitlab-duo"));
+    if (existing) {
+      return { ok: false, status: 409, error: "GitLab Duo account with this label already exists" };
+    }
+
+    const result = await db.insert(accounts).values({
+      provider: "gitlab-duo",
+      email: label,
+      password: encrypt(pat),
+      status: "active",
+      enabled: true,
+      tokens,
+      metadata,
+      quotaLimit,
+      quotaRemaining,
+      quotaResetAt,
+    } as NewAccount).returning();
+    const created = result[0]!;
+    pool.invalidate("gitlab-duo" as ProviderName);
+
+    const { refreshGitlabDuoModels } = await import("../proxy/providers/registry");
+    await refreshGitlabDuoModels();
+
+    broadcast({
+      type: "account_created",
+      data: { id: created.id, provider: "gitlab-duo", email: label },
+    });
+
+    return {
+      ok: true,
+      id: created.id,
+      label,
+      username,
+      namespacePath,
+      defaultModel,
+      modelsCount: availableModels.length,
+    };
+  } catch (e) {
+    return { ok: false, status: 500, error: e instanceof Error ? e.message : "Unknown error" };
+  }
+}
+
+/**
+ * POST /api/accounts/gitlab-duo - Create a GitLab Duo account from a PAT.
+ *
+ * Body: { gitlab_base_url?: string, pat: string, label?: string }
+ *
+ * Thin wrapper over `createGitlabDuoAccount()`.
+ */
+accountsRouter.post("/gitlab-duo", async (c) => {
+  const body = await c.req.json<{
+    gitlab_base_url?: string;
+    gitlabBaseUrl?: string;
+    pat: string;
+    label?: string;
+    gmail_email?: string;
+    gmailEmail?: string;
+    gmail_password?: string;
+    gmailPassword?: string;
+  }>();
+  const result = await createGitlabDuoAccount({
+    gitlabBaseUrl: body.gitlab_base_url ?? body.gitlabBaseUrl,
+    pat: body.pat,
+    label: body.label,
+    gmailEmail: body.gmail_email ?? body.gmailEmail,
+    gmailPassword: body.gmail_password ?? body.gmailPassword,
+  });
+  if (!result.ok) return c.json({ error: result.error }, result.status as any);
+  return c.json({
+    success: true,
+    id: result.id,
+    label: result.label,
+    username: result.username,
+    namespacePath: result.namespacePath,
+    defaultModel: result.defaultModel,
+    modelsCount: result.modelsCount,
+  }, 201);
+});
+
+/**
+ * POST /api/accounts/gitlab-duo/:id/refresh - Re-resolve namespace + models for
+ * an existing account. Useful after the user changes their default namespace
+ * or when GitLab adds new selectable models to your tier.
+ */
+accountsRouter.post("/gitlab-duo/:id/refresh", async (c) => {
+  const id = Number(c.req.param("id"));
+  const [account] = await db.select().from(accounts).where(eq(accounts.id, id));
+  if (!account || account.provider !== "gitlab-duo") {
+    return c.json({ error: "Not a GitLab Duo account" }, 404);
+  }
+
+  const tokens = (typeof account.tokens === "string"
+    ? JSON.parse(account.tokens)
+    : account.tokens) as { gitlabBaseUrl: string; namespaceId?: number };
+  const oldMeta = (typeof account.metadata === "string"
+    ? JSON.parse(account.metadata)
+    : account.metadata) ?? {};
+  const pat = decrypt(account.password);
+  const baseUrl = tokens.gitlabBaseUrl;
+
+  const headers = {
+    "Private-Token": pat,
+    "Content-Type": "application/json",
+    "User-Agent": "etteum-pool/gitlab-duo",
+  };
+
+  try {
+    // 1. Re-resolve duoDefaultNamespace (it can change in GitLab Preferences UI),
+    //    or fall back to the user's first writable group.
+    const userR = await fetch(`${baseUrl}/api/graphql`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        operationName: "getUser",
+        query: `query getUser {
+          currentUser {
+            userPreferences { duoDefaultNamespace { id fullPath } }
+            groups(first: 1, permissionScope: CREATE_PROJECTS) {
+              nodes { id fullPath }
+            }
+          }
+        }`,
+        variables: {},
+      }),
+    });
+    const userJson = (await userR.json()) as any;
+    const cu = userJson.data?.currentUser;
+    const duoNs = cu?.userPreferences?.duoDefaultNamespace;
+    const fallbackNs = cu?.groups?.nodes?.[0];
+    const ns = duoNs ?? fallbackNs;
+    if (!ns) return c.json({ error: "no namespace resolvable for this PAT" }, 400);
+
+    const namespaceId = Number(String(ns.id).split("/").pop());
+    const namespacePath = ns.fullPath;
+
+    // 2. Re-fetch the available models for that namespace
+    const modelsR = await fetch(`${baseUrl}/api/graphql`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        operationName: "lsp_aiChatAvailableModels",
+        query: `query lsp_aiChatAvailableModels($rootNamespaceId: GroupID!) {
+          metadata { version }
+          aiChatAvailableModels(rootNamespaceId: $rootNamespaceId) {
+            defaultModel { name ref }
+            selectableModels { name ref }
+          }
+        }`,
+        variables: { rootNamespaceId: `gid://gitlab/Group/${namespaceId}` },
+      }),
+    });
+    const modelsJson = (await modelsR.json()) as any;
+    const dm = modelsJson.data?.aiChatAvailableModels?.defaultModel;
+    const sm = modelsJson.data?.aiChatAvailableModels?.selectableModels;
+    const gitlabVersion = modelsJson.data?.metadata?.version ?? oldMeta.gitlabVersion ?? "";
+
+    const nextTokens = { ...tokens, namespaceId, namespacePath };
+    const nextMeta = {
+      ...oldMeta,
+      defaultModel: dm?.ref ?? oldMeta.defaultModel ?? "claude_sonnet_4_6_vertex",
+      availableModels: Array.isArray(sm) ? sm : oldMeta.availableModels ?? [],
+      gitlabVersion,
+    };
+
+    // 3. Pull current GitLab Credits balance via trialUsage so quota columns
+    //    reflect the live wallet (creditsUsed / totalCredits per user).
+    let quotaLimit = account.quotaLimit ?? 0;
+    let quotaRemaining = account.quotaRemaining ?? 0;
+    let quotaResetAt: Date | null = account.quotaResetAt ?? null;
+    try {
+      const { providers } = await import("../proxy/router");
+      const duoProvider = providers["gitlab-duo"];
+      if (duoProvider) {
+        const probe = await duoProvider.fetchQuota({
+          ...account,
+          tokens: nextTokens,
+          metadata: nextMeta,
+        });
+        if (probe.success && probe.quota && probe.quota.limit >= 0) {
+          quotaLimit = probe.quota.limit;
+          quotaRemaining = probe.quota.remaining;
+          if (probe.quota.resetAt instanceof Date) quotaResetAt = probe.quota.resetAt;
+        }
+      }
+    } catch {
+      // Non-fatal — keep stored quota values.
+    }
+
+    await db.update(accounts)
+      .set({
+        tokens: nextTokens,
+        metadata: nextMeta,
+        quotaLimit,
+        quotaRemaining,
+        quotaResetAt,
+        updatedAt: new Date(),
+      })
+      .where(eq(accounts.id, id));
+
+    // Trigger provider cache refresh so the new model list is routable immediately
+    const { refreshGitlabDuoModels } = await import("../proxy/providers/registry");
+    await refreshGitlabDuoModels();
+
+    return c.json({
+      success: true,
+      namespacePath,
+      namespaceId,
+      defaultModel: nextMeta.defaultModel,
+      modelsCount: nextMeta.availableModels.length,
+      quotaLimit,
+      quotaRemaining,
+      quotaResetAt,
+    });
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 500);
+  }
+});
 
 /**
  * GET /api/accounts/:id - Get single account
@@ -405,7 +890,7 @@ accountsRouter.get("/:id", async (c) => {
  */
 accountsRouter.post("/", async (c) => {
   const body = await c.req.json<{
-    provider: "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder";
+    provider: "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder" | "gitlab-duo";
     email?: string;
     password?: string;
     personalToken?: string;
@@ -756,6 +1241,75 @@ accountsRouter.post("/toggle-all", async (c) => {
 
   const count = await pool.setEnabledByProvider(body.provider as ProviderName, body.enabled);
   return c.json({ provider: body.provider, enabled: body.enabled, count });
+});
+
+/**
+ * POST /api/accounts/bulk-delete - Delete multiple accounts at once.
+ *
+ * Works for every provider (the row shape is identical). Defined BEFORE the
+ * dynamic `/:id` route so Hono matches the literal path first.
+ *
+ * Body: { ids: number[] }
+ * Returns: { success, requested, deleted, providers, notFound }
+ */
+accountsRouter.post("/bulk-delete", async (c) => {
+  const body = await c.req.json<{ ids?: Array<number | string> }>().catch(() => ({} as { ids?: Array<number | string> }));
+
+  // Coerce + dedupe + drop anything non-numeric so a malformed entry can't
+  // widen the delete (e.g. NaN turning into "delete everything").
+  const ids = Array.from(
+    new Set(
+      (body.ids ?? [])
+        .map((v) => Number(v))
+        .filter((n) => Number.isInteger(n) && n > 0),
+    ),
+  );
+
+  if (ids.length === 0) {
+    return c.json({ error: "ids must be a non-empty array of account ids" }, 400);
+  }
+
+  // Resolve providers up front so we can invalidate exactly the affected pools.
+  const targets = await db
+    .select({ id: accounts.id, provider: accounts.provider })
+    .from(accounts)
+    .where(inArray(accounts.id, ids));
+
+  if (targets.length === 0) {
+    return c.json({ error: "No matching accounts found" }, 404);
+  }
+
+  const foundIds = targets.map((t) => t.id);
+  const providersAffected = Array.from(new Set(targets.map((t) => t.provider)));
+
+  // Nullify / clean foreign keys before the delete (mirrors DELETE /:id).
+  await db.update(requestLogs).set({ accountId: null }).where(inArray(requestLogs.accountId, foundIds));
+  await db.update(vccCards).set({ usedByAccountId: null }).where(inArray(vccCards.usedByAccountId, foundIds));
+  await db.delete(vccTransactions).where(inArray(vccTransactions.accountId, foundIds));
+
+  const result = await db.delete(accounts).where(inArray(accounts.id, foundIds)).returning();
+  const deletedIds = result.map((r) => r.id);
+
+  for (const provider of providersAffected) {
+    pool.invalidate(provider as ProviderName);
+  }
+  // Mirror single-delete's broadcast shape per id so existing dashboard
+  // listeners (`account_deleted`) keep working without changes, then send
+  // one summary frame for clients that prefer the bulk signal.
+  for (const id of deletedIds) {
+    broadcast({ type: "account_deleted", data: { id } });
+  }
+  broadcast({ type: "accounts_deleted", data: { ids: deletedIds, providers: providersAffected } });
+
+  const notFound = ids.filter((id) => !foundIds.includes(id));
+  return c.json({
+    success: true,
+    requested: ids.length,
+    deleted: deletedIds.length,
+    deletedIds,
+    providers: providersAffected,
+    notFound,
+  });
 });
 
 /**

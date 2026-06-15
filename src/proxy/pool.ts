@@ -147,6 +147,74 @@ class AccountPool {
   }
 
   /**
+   * Decrement the Qoder Free counter (mirror of /activity qmodel_latest).
+   * Used for requests routed to qd-Qwen3.7-Max (the only Free-promo model).
+   * Returns new freeRemaining (clamped at 0).
+   */
+  async decrementFreeQuota(accountId: number, creditsUsed: number): Promise<number> {
+    if (!Number.isFinite(creditsUsed) || creditsUsed <= 0) {
+      const [account] = await db
+        .select({ freeRemaining: accounts.freeRemaining })
+        .from(accounts)
+        .where(eq(accounts.id, accountId))
+        .limit(1);
+      return Number(account?.freeRemaining || 0);
+    }
+
+    const [account] = await db
+      .update(accounts)
+      .set({
+        freeRemaining: sql`MAX(0, COALESCE(${accounts.freeRemaining}, 0) - ${creditsUsed})`,
+        updatedAt: new Date(),
+      })
+      .where(eq(accounts.id, accountId))
+      .returning({ freeRemaining: accounts.freeRemaining });
+
+    return Number(account?.freeRemaining || 0);
+  }
+
+  /**
+   * Mark a Qoder account `exhausted` ONLY if both counters are depleted.
+   *
+   * Rules:
+   *   - Free out: freeLimit > 0 AND freeRemaining <= 0
+   *   - All out:  quotaLimit > 0 AND quotaRemaining <= 0
+   *   - All not-applicable: quotaLimit <= 0 (Qoder /quota/usage sentinel "no data")
+   *   - exhausted ⇔ Free out AND (All out OR All not-applicable)
+   *     AND (Free not-applicable OR Free out) — i.e. at least one was applicable and is out
+   *
+   * If neither Free nor All has a positive limit at all, treat as not-applicable
+   * (don't mark exhausted from this path — let the probe/warmup decide).
+   */
+  async markExhaustedIfFullyDepleted(accountId: number): Promise<void> {
+    const [a] = await db.select().from(accounts).where(eq(accounts.id, accountId)).limit(1);
+    if (!a) return;
+
+    const freeLim = Number(a.freeLimit ?? 0);
+    const freeRem = Number(a.freeRemaining ?? 0);
+    const allLim = Number(a.quotaLimit ?? 0);
+    const allRem = Number(a.quotaRemaining ?? 0);
+
+    const freeApplicable = freeLim > 0;
+    const allApplicable = allLim > 0;
+    const freeOut = freeApplicable && freeRem <= 0;
+    const allOut = allApplicable && allRem <= 0;
+
+    // Neither bucket applicable — nothing to decide here.
+    if (!freeApplicable && !allApplicable) return;
+
+    // Both applicable: need both depleted.
+    if (freeApplicable && allApplicable) {
+      if (freeOut && allOut) await this.markExhausted(accountId);
+      return;
+    }
+
+    // Only one applicable: that one being out is sufficient.
+    if (freeApplicable && freeOut) await this.markExhausted(accountId);
+    else if (allApplicable && allOut) await this.markExhausted(accountId);
+  }
+
+  /**
    * Check and reset daily quota for Qoder accounts.
    * - If quotaLimit === 0: initialize with dailyLimit
    * - If quotaResetAt has passed: reset quotaRemaining to dailyLimit, set quotaResetAt to next midnight

@@ -535,6 +535,97 @@ export async function loginAccount(account: Account, options: LoginOptions = {})
     const credentials = providerResult.credentials || {};
     const quota = providerResult.quota || {};
 
+    // GitLab Duo: the bot returned a freshly-generated PAT. Hand it off to the
+    // canonical account-creation pipeline (`createGitlabDuoAccount`) which
+    // validates the PAT, resolves the namespace, fetches available models and
+    // updates this row in-place. We do this here — instead of in the standard
+    // path below — because the PAT must be re-encrypted as `password`, the
+    // tokens column needs the gitlab-specific shape {gitlabBaseUrl, namespaceId,
+    // namespacePath, userId}, and the metadata must contain the model list.
+    if (provider === "gitlab-duo") {
+      const pat = (credentials as Record<string, string>).pat || "";
+      const baseUrl = (credentials as Record<string, string>).gitlab_base_url || "https://gitlab.com";
+      const gmailEmail = (credentials as Record<string, string>).gmail_email || account.email;
+      const gmailPassword = (credentials as Record<string, string>).gmail_password || password;
+
+      if (!pat) {
+        const errorMsg = "Bot finished but did not return a PAT";
+        await markAccountError(account.id, errorMsg);
+        const log = addAuthLog({
+          type: "login_failed",
+          accountId: account.id,
+          email: account.email,
+          provider,
+          error: errorMsg,
+          message: errorMsg,
+        });
+        broadcast({
+          type: "login_failed",
+          data: { logId: log.id, id: account.id, email: account.email, provider, error: errorMsg },
+        });
+        return { success: false, error: errorMsg };
+      }
+
+      const { createGitlabDuoAccount } = await import("../api/accounts");
+      const finalize = await createGitlabDuoAccount({
+        gitlabBaseUrl: baseUrl,
+        pat,
+        // Keep the gmail address as the row label so users can recognize the
+        // account in the dashboard. createGitlabDuoAccount will preserve it
+        // when `existingAccountId` is provided.
+        label: account.email,
+        existingAccountId: account.id,
+        gmailEmail,
+        gmailPassword,
+      });
+
+      if (!finalize.ok) {
+        const errorMsg = `PAT validation failed: ${finalize.error}`;
+        await markAccountError(account.id, errorMsg);
+        const log = addAuthLog({
+          type: "login_failed",
+          accountId: account.id,
+          email: account.email,
+          provider,
+          error: errorMsg,
+          message: errorMsg,
+        });
+        broadcast({
+          type: "login_failed",
+          data: { logId: log.id, id: account.id, email: account.email, provider, error: errorMsg },
+        });
+        return { success: false, error: errorMsg };
+      }
+
+      const successLog = addAuthLog({
+        type: "login_success",
+        accountId: account.id,
+        email: account.email,
+        provider,
+        step: "success",
+        message: `GitLab Duo onboarded: ${finalize.username} (${finalize.modelsCount} models, default=${finalize.defaultModel})`,
+        data: {
+          username: finalize.username,
+          namespacePath: finalize.namespacePath,
+          modelsCount: finalize.modelsCount,
+          defaultModel: finalize.defaultModel,
+        },
+      });
+      broadcast({
+        type: "login_success",
+        data: {
+          logId: successLog.id,
+          id: account.id,
+          email: account.email,
+          provider,
+          modelsCount: finalize.modelsCount,
+          defaultModel: finalize.defaultModel,
+        },
+      });
+
+      return { success: true, tokens: credentials, quota };
+    }
+
     // Kiro Pro: upgrade must succeed before marking active
     if (provider === "kiro-pro" && config.kiroProUpgrade) {
       const upgradeResult = (providerResult as any).upgrade as

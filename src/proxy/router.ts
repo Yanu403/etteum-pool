@@ -185,7 +185,14 @@ export async function routeRequest(
         continue; // Try next account without poisoning this one
       }
 
-      // Handle quota exhaustion (402 without PAYG)
+      // Handle quota exhaustion (402 / 403 without PAYG).
+      //
+      // Trust upstream: if the provider reports quota exhausted, mark it
+      // and move on. For Qoder, the next warmup tick will re-fetch
+      // /activity and /quota/usage and flip the account back to active
+      // automatically if Qoder reports remaining > 0 again. We accept the
+      // occasional false-exhaust (lifted within one warmup cycle) in
+      // exchange for never serving a known-bad account on retry.
       if (result.quotaExhausted) {
         await pool.markExhausted(account.id);
         lastError = result.error || "Quota exhausted";

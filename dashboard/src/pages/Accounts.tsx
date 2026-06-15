@@ -42,7 +42,7 @@ import {
   type ByokProvider,
 } from "@/lib/api";
 
-type Provider = "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder";
+type Provider = "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder" | "gitlab-duo";
 
 interface Account {
   id: number;
@@ -53,13 +53,14 @@ interface Account {
   quotaRemaining?: number;
 }
 
-const providers: Provider[] = ["kiro", "kiro-pro", "codebuddy", "canva", "codex", "qoder"];
+const providers: Provider[] = ["kiro", "kiro-pro", "codebuddy", "canva", "codex", "qoder", "gitlab-duo"];
 
 function labelProvider(provider: string) {
   if (provider === "kiro-pro") return "Kiro Pro";
   if (provider === "codebuddy") return "CodeBuddy";
   if (provider === "codex") return "Codex";
   if (provider === "qoder") return "Qoder";
+  if (provider === "gitlab-duo") return "GitLab Duo";
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 
@@ -88,6 +89,10 @@ export default function Accounts() {
   const [codexOauthBusy, setCodexOauthBusy] = useState(false);
   const [codexOauthAuthUrl, setCodexOauthAuthUrl] = useState("");
   const [codexOauthCallbackUrl, setCodexOauthCallbackUrl] = useState("");
+  const [gitlabBaseUrl, setGitlabBaseUrl] = useState("https://gitlab.com");
+  const [gitlabPat, setGitlabPat] = useState("");
+  const [gitlabLabel, setGitlabLabel] = useState("");
+  const [gitlabBusy, setGitlabBusy] = useState(false);
   const [loginPendingDialog, setLoginPendingDialog] = useState(false);
   const [loginPendingConcurrency, setLoginPendingConcurrency] = useState(2);
   const [byokProviders, setByokProviders] = useState<ByokProvider[]>([]);
@@ -347,6 +352,30 @@ export default function Accounts() {
     } catch (err) { showError(err); }
   }
 
+  async function handleGitlabPatLogin() {
+    const pat = gitlabPat.trim();
+    if (!pat) { showError(new Error("Paste GitLab Personal Access Token")); return; }
+    const baseUrl = (gitlabBaseUrl || "https://gitlab.com").trim().replace(/\/$/, "");
+    setGitlabBusy(true);
+    try {
+      const res = await fetchApi<any>("/api/accounts/gitlab-duo", {
+        method: "POST",
+        body: JSON.stringify({
+          gitlab_base_url: baseUrl,
+          pat,
+          label: gitlabLabel.trim() || undefined,
+        }),
+      });
+      const labelText = res?.account?.email || res?.email || "account";
+      showSuccess(`GitLab Duo ${labelText} added successfully`);
+      setGitlabPat("");
+      setGitlabLabel("");
+      setAddDialogProvider(null);
+      await load();
+    } catch (err) { showError(err); }
+    finally { setGitlabBusy(false); }
+  }
+
   async function handleBulkImport() {
     if (!addDialogProvider || !bulkText.trim()) { showError(new Error("Paste email|password lines")); return; }
     try {
@@ -526,6 +555,9 @@ export default function Accounts() {
   function handleOpenAddDialog(provider: Provider) {
     resetCodexOAuthFlow();
     if (provider === "codex") {
+      setAddMode("pat");
+    }
+    if (provider === "gitlab-duo") {
       setAddMode("pat");
     }
     setAddDialogProvider(provider);
@@ -1245,6 +1277,8 @@ export default function Accounts() {
                 ? "Add via browser login or instant login with API key/token."
                 : addDialogProvider === "qoder"
                 ? "Add via PAT, bulk Google accounts, or single account."
+                : addDialogProvider === "gitlab-duo"
+                ? "Add via Personal Access Token, single Gmail (bot login), or bulk email|password."
                 : `Add account for ${addDialogProvider ? labelProvider(addDialogProvider) : "this provider"}.`}
             </DialogDescription>
           </DialogHeader>
@@ -1277,6 +1311,18 @@ export default function Accounts() {
                 className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "single" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
               >Single</button>
             </div>
+          ) : addDialogProvider === "gitlab-duo" ? (
+            <div className="flex gap-1 rounded-md bg-[var(--secondary)] p-1">
+              <button onClick={() => setAddMode("pat")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "pat" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              >PAT (Token)</button>
+              <button onClick={() => setAddMode("single")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "single" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              >Gmail (Single)</button>
+              <button onClick={() => setAddMode("bulk")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "bulk" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              >Bulk (Email|Pass)</button>
+            </div>
           ) : (
             <div className="flex gap-1 rounded-md bg-[var(--secondary)] p-1">
               <button onClick={() => setAddMode("bulk")}
@@ -1304,6 +1350,60 @@ export default function Accounts() {
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={() => setAddDialogProvider(null)}>Cancel</Button>
                 <Button onClick={handleCookieLogin}>Add Account</Button>
+              </div>
+            </div>
+          )}
+
+          {addMode === "pat" && addDialogProvider === "gitlab-duo" && (
+            <div className="space-y-4">
+              <div>
+                <label className="text-sm text-[var(--foreground)]">GitLab Base URL</label>
+                <Input
+                  value={gitlabBaseUrl}
+                  onChange={(e) => setGitlabBaseUrl(e.target.value)}
+                  placeholder="https://gitlab.com"
+                  className="mt-1 font-mono text-sm"
+                  disabled={gitlabBusy}
+                />
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]">Default <code>https://gitlab.com</code>. Ganti kalau pakai self-hosted GitLab.</p>
+              </div>
+              <div>
+                <label className="text-sm text-[var(--foreground)]">Personal Access Token (PAT)</label>
+                <textarea
+                  value={gitlabPat}
+                  onChange={(e) => setGitlabPat(e.target.value)}
+                  className="mt-1 w-full h-28 rounded-md border border-[var(--border)] bg-[var(--background)] p-3 text-sm font-mono text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--ring)] resize-none"
+                  placeholder="glpat-xxxxxxxxxxxxxxxxxxxx"
+                  disabled={gitlabBusy}
+                />
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                  Butuh scope <code>api</code>. Buat di{" "}
+                  <a
+                    href={`${(gitlabBaseUrl || "https://gitlab.com").replace(/\/$/, "")}/-/user_settings/personal_access_tokens?scopes=api&name=poolprox3-duo`}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="underline text-[var(--foreground)] hover:opacity-80"
+                  >
+                    User Settings → Access Tokens
+                  </a>.
+                </p>
+              </div>
+              <div>
+                <label className="text-sm text-[var(--foreground)]">Label (opsional)</label>
+                <Input
+                  value={gitlabLabel}
+                  onChange={(e) => setGitlabLabel(e.target.value)}
+                  placeholder="default: GitLab username"
+                  className="mt-1"
+                  disabled={gitlabBusy}
+                />
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]">Kosongkan untuk pakai username GitLab. Harus unik per instance.</p>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setAddDialogProvider(null)} disabled={gitlabBusy}>Cancel</Button>
+                <Button onClick={handleGitlabPatLogin} disabled={gitlabBusy || !gitlabPat.trim()}>
+                  {gitlabBusy ? (<><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Validating PAT...</>) : "Add Account"}
+                </Button>
               </div>
             </div>
           )}
@@ -1394,6 +1494,12 @@ export default function Accounts() {
           {/* Bulk mode (all providers) */}
           {addMode === "bulk" && (
             <div className="space-y-4">
+              {addDialogProvider === "gitlab-duo" && (
+                <div className="rounded-md border border-[var(--success)]/40 bg-[var(--success)]/10 p-3 text-xs text-[var(--foreground)] space-y-1">
+                  <div><strong>Bot otomasi GitLab Duo aktif.</strong> Alurnya: Google OAuth → konfirmasi OTP via Gmail web → form Welcome → Free Trial Singapore → toggle Duo experiment → generate PAT (<code>poolprox3-duo</code>) → simpan ke akun.</div>
+                  <div className="text-[var(--muted-foreground)]">⏱ Estimasi 4–6 menit per akun. <strong>Concurrency=1 disarankan</strong> agar Gmail tidak rate-limit. Pakai akun Gmail tanpa 2FA.</div>
+                </div>
+              )}
               <div>
                 <label className="text-sm text-[var(--foreground)]">Accounts (email|password per baris)</label>
                 <textarea
@@ -1436,6 +1542,12 @@ export default function Accounts() {
           {/* Single mode (all providers) */}
           {addMode === "single" && (
             <div className="space-y-4">
+              {addDialogProvider === "gitlab-duo" && (
+                <div className="rounded-md border border-[var(--success)]/40 bg-[var(--success)]/10 p-3 text-xs text-[var(--foreground)] space-y-1">
+                  <div><strong>Bot otomasi GitLab Duo aktif.</strong> Login Gmail di bawah lalu bot akan: Google OAuth → konfirmasi OTP via Gmail web → form Welcome → Free Trial Singapore → toggle Duo experiment → generate PAT.</div>
+                  <div className="text-[var(--muted-foreground)]">⏱ Estimasi 4–6 menit. Pakai akun Gmail tanpa 2FA. Untuk batch banyak akun, gunakan tab <strong>Bulk</strong>.</div>
+                </div>
+              )}
               <div>
                 <label className="text-sm text-[var(--foreground)]">Email</label>
                 <Input value={addForm.email} onChange={(e) => setAddForm({ ...addForm, email: e.target.value })} placeholder="email@example.com" className="mt-1" />

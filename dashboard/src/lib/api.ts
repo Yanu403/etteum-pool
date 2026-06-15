@@ -371,6 +371,20 @@ export async function deleteAccount(id: number) {
   return fetchApi(`/api/accounts/${id}`, { method: "DELETE" });
 }
 
+export async function bulkDeleteAccounts(ids: number[]): Promise<{
+  success: boolean;
+  requested: number;
+  deleted: number;
+  deletedIds: number[];
+  providers: string[];
+  notFound: number[];
+}> {
+  return fetchApi("/api/accounts/bulk-delete", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+}
+
 export async function toggleAccountEnabled(id: number, enabled?: boolean) {
   return fetchApi<{ id: number; enabled: boolean; status: string; provider: string }>(
     `/api/accounts/${id}/toggle`,
