@@ -1145,7 +1145,9 @@ export class GitlabDuoProvider extends BaseProvider {
           const matched = ToolBridge.match(action, request.tools);
           if (config.gitlabDuoLogToolBridge) {
             const kind = Object.keys(action).find((k) => k !== "requestID");
-            const declared = (request.tools ?? []).map((t) => (t as any)?.name).filter(Boolean);
+            const declared = (request.tools ?? [])
+              .map((t) => (t as any)?.function?.name ?? (t as any)?.name)
+              .filter(Boolean);
             // eslint-disable-next-line no-console
             console.warn(
               `[gitlab-duo] tool-bridge action=${kind} → ${matched ? matched.name : "(unmatched)"} ` +
@@ -1154,7 +1156,16 @@ export class GitlabDuoProvider extends BaseProvider {
           }
           if (matched) {
             toolCall = {
-              id: `toolu_${cryptoRandom()}`,
+              // OpenAI-native ID prefix. The OpenAI tool-calling spec treats
+              // `tool_calls[].id` as an opaque string, but several strict
+              // client accumulators (and some proxies) validate the shape and
+              // silently drop a tool call whose id doesn't look like an OpenAI
+              // id. `toolu_` is the Anthropic convention and was the source of
+              // OpenAI-compatible clients quietly ignoring the tool round.
+              // Lookup is by exact string everywhere (registerSession /
+              // findSessionByAnyId / tool_call_id read-back), so the prefix is
+              // free to change — round-trip stays intact.
+              id: `call_${cryptoRandom()}`,
               name: matched.name,
               argsJson: matched.argsJson,
               requestID: matched.requestID,

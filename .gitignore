@@ -83,3 +83,7 @@ drizzle/
 
 # Nested git repos (external services)
 services/windsurf-api/
+
+# Local artifacts
+poolprox.db
+test-compat.out

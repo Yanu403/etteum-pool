@@ -28,6 +28,16 @@ interface ToolSchema {
   required?: string[];
 }
 
+/** A single client-declared tool, in either the Anthropic (flat `name` +
+ *  `input_schema`/`parameters`) or OpenAI (nested `function.name` +
+ *  `function.parameters`) wire format. `normalizeTools()` flattens both. */
+interface ClientTool {
+  name?: string;
+  input_schema?: ToolSchema;
+  parameters?: ToolSchema;
+  function?: { name?: string; parameters?: ToolSchema };
+}
+
 export interface MatchedToolCall {
   /** Client-facing tool name (must match one of clientTools[].name when
    *  matched, or a sane default otherwise). */
@@ -128,13 +138,24 @@ export class ToolBridge {
    */
   static match(
     action: ServerAction,
-    clientTools: Array<{ name?: string; input_schema?: ToolSchema; parameters?: ToolSchema }> | undefined,
+    clientTools: ClientTool[] | undefined,
   ): MatchedToolCall | null {
     const kind = ToolBridge.actionKind(action);
     if (!kind) return null;
 
-    const tools = clientTools ?? [];
-    const declared = tools.map((t) => (t?.name ?? "").toString());
+    // Normalize the client's tool list up front into a flat {name, props}
+    // shape that accepts BOTH wire formats:
+    //   • Anthropic: { name, input_schema | parameters }
+    //   • OpenAI:    { type:"function", function:{ name, parameters } }
+    // Without this, an OpenAI-Compatible client (tools nested under
+    // `function.*`) yields empty names + undefined schemas, so nothing ever
+    // matches and every action dies as "(unmatched)". See normalizeTools().
+    const tools = ToolBridge.normalizeTools(clientTools);
+    const declared = tools.map((t) => t.name);
+    const propsOf = (name: string): Record<string, unknown> =>
+      tools.find((t) => t.name === name)?.props ?? {};
+    const requiredOf = (name: string): string[] =>
+      tools.find((t) => t.name === name)?.required ?? [];
 
     // Special case: runMCPCall carries its own tool name. Try to honor it
     // verbatim, then fall through to a name-similarity lookup, then emit it
@@ -146,12 +167,9 @@ export class ToolBridge {
                                      || d.toLowerCase() === mcp.tool.toLowerCase());
       const sub = exact ?? declared.find((d) => d.toLowerCase().includes(mcp.tool.toLowerCase()));
       const toolName = sub ?? wanted;
-      const matchedTool = tools.find((t) => (t?.name ?? "") === toolName);
-      const schema = matchedTool?.input_schema ?? matchedTool?.parameters;
-      const props = schema?.properties ?? {};
       return {
         name: toolName,
-        argsJson: ToolBridge.argsFor(action, toolName, props),
+        argsJson: ToolBridge.argsFor(action, toolName, propsOf(toolName), requiredOf(toolName)),
         requestID: action.requestID,
       };
     }
@@ -159,16 +177,32 @@ export class ToolBridge {
     const candidates = ToolBridge.CANDIDATES[kind] ?? [];
     const fallback = ToolBridge.FALLBACK[kind] ?? "Bash";
 
+    // Guard for batch-read: a tool only qualifies for runReadFiles if it can
+    // actually accept an array of paths. Single-file readers like Claude Code's
+    // `Read` (only `file_path`) would silently reject `{paths:[...]}`, so we
+    // reject them here and let the Bash-emulation path (step 3) take over.
+    const acceptsTool = (name: string): boolean => {
+      if (kind !== "runReadFiles") return true;
+      const keys = Object.keys(propsOf(name));
+      // If the schema is empty we can't prove it's a batch reader → reject so
+      // we fall through to Bash, which always works for multi-file reads.
+      return keys.some((k) => ["paths", "file_paths", "filepaths", "files"]
+        .some((c) => c.toLowerCase() === k.toLowerCase()));
+    };
+
     // 1. Prefer an exact / case-insensitive match against declared tools.
     let toolName: string | null = null;
     for (const cand of candidates) {
-      const hit = declared.find((d) => d.toLowerCase() === cand.toLowerCase());
+      const hit = declared.find((d) => d.toLowerCase() === cand.toLowerCase() && acceptsTool(d));
       if (hit) { toolName = hit; break; }
     }
     if (!toolName) {
       // 2. Substring fallback (e.g. client declared "execute_bash" → matches "bash").
+      //    Use a word-boundary-aware match so short candidates like "ls" don't
+      //    falsely hit unrelated tools (e.g. "KillShell" contains "ls", and
+      //    "BashOutput" contains "bash"). See `looseMatch`.
       for (const cand of candidates) {
-        const hit = declared.find((d) => d.toLowerCase().includes(cand.toLowerCase()));
+        const hit = declared.find((d) => ToolBridge.looseMatch(d, cand) && acceptsTool(d));
         if (hit) { toolName = hit; break; }
       }
     }
@@ -187,7 +221,7 @@ export class ToolBridge {
       }
       if (!toolName) {
         for (const cand of bashLike) {
-          const hit = declared.find((d) => d.toLowerCase().includes(cand.toLowerCase()));
+          const hit = declared.find((d) => ToolBridge.looseMatch(d, cand));
           if (hit) { toolName = hit; break; }
         }
       }
@@ -201,15 +235,69 @@ export class ToolBridge {
     // Look up the actual schema of the matched tool — we shape args to its
     // declared property names so e.g. Claude Code's `file_path` doesn't end
     // up as `path: undefined` on the client.
-    const matchedTool = tools.find((t) => (t?.name ?? "") === toolName);
-    const schema = matchedTool?.input_schema ?? matchedTool?.parameters;
-    const props = schema?.properties ?? {};
-
     return {
       name: toolName,
-      argsJson: ToolBridge.argsFor(action, toolName, props),
+      argsJson: ToolBridge.argsFor(action, toolName, propsOf(toolName), requiredOf(toolName)),
       requestID: action.requestID,
     };
+  }
+
+  /** Flatten a client's declared tools into a uniform {name, props} list,
+   *  accepting both the Anthropic and OpenAI tool wire formats:
+   *
+   *    Anthropic: { name, input_schema?: {properties}, parameters?: {properties} }
+   *    OpenAI:    { type: "function", function: { name, parameters: {properties} } }
+   *
+   *  OpenAI nests the name + schema under `function`, so reading `t.name`
+   *  directly (as the rest of match() does) would see `undefined` for every
+   *  OpenAI-Compatible client and match nothing. Normalizing once here keeps
+   *  the matching logic format-agnostic. Entries without a resolvable name are
+   *  dropped — they can never be matched and only pollute `declared`. */
+  private static normalizeTools(
+    clientTools: ClientTool[] | undefined,
+  ): Array<{ name: string; props: Record<string, unknown>; required: string[] }> {
+    return (clientTools ?? [])
+      .map((t) => {
+        const fn = t?.function;
+        const name = (fn?.name ?? t?.name ?? "").toString();
+        const schema = fn?.parameters ?? t?.input_schema ?? t?.parameters;
+        return {
+          name,
+          props: schema?.properties ?? {},
+          // Carry the client's `required` list so argsFor() can satisfy
+          // mandatory fields the action doesn't map to (e.g. Claude Code's
+          // Bash tool requires BOTH `command` and `description`; omitting
+          // `description` makes the client reject the call with
+          // `SchemaError(Missing key at ["description"])`).
+          required: Array.isArray(schema?.required) ? schema!.required : [],
+        };
+      })
+      .filter((t) => t.name.length > 0);
+  }
+
+  /** Word-boundary-aware substring match used for the fallback tool lookup.
+   *
+   *  Plain `.includes()` is dangerous for short candidates: "ls" matches
+   *  "KillShell", "bash" matches "BashOutput", etc. — silently routing an
+   *  action to the wrong tool. We instead require the candidate to appear at
+   *  a token boundary (start/end of name, or delimited by `_`/`-`/case
+   *  change). Candidates ≤ 2 chars (e.g. "ls") must match a whole token. */
+  private static looseMatch(declared: string, candidate: string): boolean {
+    const d = declared.toLowerCase();
+    const c = candidate.toLowerCase();
+    if (d === c) return true;
+    // Split the declared name into tokens on delimiters and camelCase humps:
+    // "KillShell" → ["kill","shell"], "execute_bash" → ["execute","bash"].
+    const tokens = declared
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[\s_\-]+/)
+      .map((t) => t.toLowerCase())
+      .filter(Boolean);
+    if (tokens.includes(c)) return true;
+    // For longer candidates, allow a substring within a single token
+    // (e.g. "command" inside "runcommandtool") — but never for ≤ 2 chars.
+    if (c.length <= 2) return false;
+    return tokens.some((t) => t.includes(c));
   }
 
   /** Pick the first property name from the schema that's in `candidates`,
@@ -229,6 +317,35 @@ export class ToolBridge {
     return candidates[0] ?? "value";
   }
 
+  /** True if the schema declares any of `candidates` (case-insensitive). */
+  private static hasField(
+    props: Record<string, unknown>,
+    candidates: string[],
+  ): boolean {
+    const lowerKeys = Object.keys(props).map((k) => k.toLowerCase());
+    return candidates.some((c) => lowerKeys.includes(c.toLowerCase()));
+  }
+
+  /** Drop any key not declared by the tool's schema. No-op when the schema is
+   *  empty (we can't prove what's valid, so we pass everything through and let
+   *  the client decide — same behavior as before this guard existed). This
+   *  prevents hallucinated/optional fields (e.g. `-i`, `file_path`) from
+   *  reaching a client whose schema doesn't declare them, which would make the
+   *  client reject the entire tool call. */
+  private static prune(
+    out: Record<string, unknown>,
+    props: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const keys = Object.keys(props);
+    if (keys.length === 0) return out;
+    const allowed = new Set(keys.map((k) => k.toLowerCase()));
+    const filtered: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(out)) {
+      if (allowed.has(k.toLowerCase())) filtered[k] = v;
+    }
+    return filtered;
+  }
+
   private static actionKind(a: ServerAction): keyof typeof ToolBridge.CANDIDATES | null {
     for (const k of Object.keys(ToolBridge.CANDIDATES)) {
       if (k in a) return k as keyof typeof ToolBridge.CANDIDATES;
@@ -245,6 +362,83 @@ export class ToolBridge {
     a: ServerAction,
     toolName: string,
     props: Record<string, unknown> = {},
+    required: string[] = [],
+  ): string {
+    // Build the natural arg mapping, then satisfy any mandatory fields the
+    // action didn't populate (e.g. Claude Code Bash requires `description`).
+    const json = ToolBridge.argsForInner(a, toolName, props);
+    return ToolBridge.fillRequired(json, props, required, a);
+  }
+
+  /** Ensure every `required` field declared by the client's schema is present
+   *  in the emitted args. Some clients (notably Claude Code's Bash tool) mark
+   *  `description` as required in addition to `command`; an action like
+   *  `runShellCommand` only yields `command`, so without this the client
+   *  rejects the whole call with `SchemaError(Missing key at ["description"])`.
+   *
+   *  We only add keys the schema actually declares (so we never inject fields
+   *  the client doesn't know about), and only when they're missing. Defaults:
+   *  `description` → a short human summary of the action; everything else → "".
+   *  No-op when the schema declares no `required` fields. */
+  private static fillRequired(
+    json: string,
+    props: Record<string, unknown>,
+    required: string[],
+    a: ServerAction,
+  ): string {
+    if (!required || required.length === 0) return json;
+    let out: Record<string, unknown>;
+    try {
+      out = JSON.parse(json) as Record<string, unknown>;
+    } catch {
+      return json; // non-object payloads are passed through untouched
+    }
+    if (out === null || typeof out !== "object" || Array.isArray(out)) return json;
+
+    const present = new Set(Object.keys(out).map((k) => k.toLowerCase()));
+    const declared = new Set(Object.keys(props).map((k) => k.toLowerCase()));
+    const DESC = ["description", "desc", "summary"];
+
+    for (const field of required) {
+      const lf = field.toLowerCase();
+      if (present.has(lf)) continue;
+      // Only fill fields the schema actually declares. (`required` should be a
+      // subset of `properties`, but be defensive against malformed schemas.)
+      if (declared.size > 0 && !declared.has(lf)) continue;
+      if (DESC.includes(lf)) {
+        out[field] = ToolBridge.describeAction(a, out);
+      } else {
+        out[field] = "";
+      }
+    }
+    return JSON.stringify(out);
+  }
+
+  /** A short, human-readable one-liner describing what an action does, used to
+   *  satisfy a required `description` field. Prefers the actual command/path in
+   *  the already-built args so the summary is accurate. */
+  private static describeAction(
+    a: ServerAction,
+    out: Record<string, unknown>,
+  ): string {
+    const cmd = out["command"] ?? out["cmd"] ?? out["script"];
+    if (typeof cmd === "string" && cmd.trim()) {
+      const oneLine = cmd.replace(/\s+/g, " ").trim();
+      return oneLine.length > 80 ? `${oneLine.slice(0, 77)}...` : oneLine;
+    }
+    const path = out["file_path"] ?? out["path"] ?? out["filename"];
+    if (typeof path === "string" && path.trim()) return `Operate on ${path}`;
+    const kind = ToolBridge.actionKind(a);
+    return kind ? `Run ${kind}` : "Run tool";
+  }
+
+  /** Core arg-shaping logic. Returns a JSON string mapping the action onto the
+   *  client tool's declared property names. `argsFor()` wraps this to backfill
+   *  required fields. */
+  private static argsForInner(
+    a: ServerAction,
+    toolName: string,
+    props: Record<string, unknown> = {},
   ): string {
     const lower = toolName.toLowerCase();
     const payload = ToolBridge.payload(a);
@@ -253,6 +447,9 @@ export class ToolBridge {
     const F_CMD = ["command", "cmd", "shell_command", "script"];
     const F_PATH = ["file_path", "path", "filepath", "filename", "file"];
     const F_DIR = ["directory_path", "directory", "path", "dir", "folder"];
+    // Directory listing tools (Claude Code `LS`) use `path`; keep it first so
+    // an empty schema defaults to `path` rather than `file_path`/`directory_path`.
+    const F_LS_PATH = ["path", "directory", "dir", "directory_path", "folder"];
     const F_CONTENT = ["content", "contents", "text", "data", "body"];
     const F_OLD = ["old_string", "oldString", "old", "search", "from", "before"];
     const F_NEW = ["new_string", "newString", "new", "replace", "to", "after"];
@@ -310,7 +507,14 @@ export class ToolBridge {
 
     if ("runReadFiles" in a) {
       const p = a.runReadFiles;
-      if (lower.includes("bash") || lower.includes("shell") || lower === "terminal") {
+      // A native batch-read tool must declare an array-of-paths field; only
+      // then do we hand it the list. Claude Code's `Read` takes a SINGLE
+      // `file_path` with no batch mode, so match() routes runReadFiles to Bash
+      // when the only read-ish tool can't take an array (see match()).
+      const hasPathsField = Object.keys(props).some((k) =>
+        F_PATHS.some((c) => c.toLowerCase() === k.toLowerCase()),
+      );
+      if (!hasPathsField && (lower.includes("bash") || lower.includes("shell") || lower === "terminal")) {
         // `for f in ...; do echo "===$f==="; cat "$f"; done` keeps boundaries.
         const args = p.filepaths.map(shellQuote).join(" ");
         const cmd = `for f in ${args}; do echo "=== $f ==="; cat "$f"; done`;
@@ -370,12 +574,15 @@ export class ToolBridge {
 
     if ("listDirectory" in a || "scanDirectoryTree" in a) {
       const p = ("listDirectory" in a ? a.listDirectory : a.scanDirectoryTree);
-      if (lower.includes("bash") || lower.includes("shell")) {
+      if (lower.includes("bash") || lower.includes("shell") || lower.includes("command") || lower === "terminal") {
         return JSON.stringify({
           [ToolBridge.pickField(props, F_CMD)]: `ls -la ${shellQuote(p.directory)}`,
         });
       }
-      return JSON.stringify({ [ToolBridge.pickField(props, F_PATH)]: p.directory });
+      // Native directory-listing tools (Claude Code's `LS`) use `path`, NOT
+      // `file_path`. Order candidates so `path` wins, and default to `path`
+      // when the schema is empty — `file_path` would be rejected by `LS`.
+      return JSON.stringify({ [ToolBridge.pickField(props, F_LS_PATH)]: p.directory });
     }
 
     if ("findFiles" in a) {
@@ -387,7 +594,7 @@ export class ToolBridge {
         if (p.search_directory) out[ToolBridge.pickField(props, F_PATH)] = p.search_directory;
         return JSON.stringify(out);
       }
-      if (lower.includes("bash") || lower.includes("shell")) {
+      if (lower.includes("bash") || lower.includes("shell") || lower.includes("command") || lower === "terminal") {
         const dir = p.search_directory || ".";
         return JSON.stringify({
           [ToolBridge.pickField(props, F_CMD)]: `find ${shellQuote(dir)} -name ${shellQuote(p.name_pattern)}`,
@@ -402,9 +609,16 @@ export class ToolBridge {
         const out: Record<string, unknown> = {
           [ToolBridge.pickField(props, F_PATTERN)]: p.pattern,
         };
-        if (p.search_directory) out[ToolBridge.pickField(props, F_PATH)] = p.search_directory;
-        if (p.case_insensitive) out["-i"] = true;
-        return JSON.stringify(out);
+        // Only attach optional args the tool actually declares. Claude Code's
+        // `Grep` schema may expose only `pattern`; emitting `file_path`/`-i`
+        // when they aren't declared makes the client reject the whole call.
+        if (p.search_directory && ToolBridge.hasField(props, F_PATH)) {
+          out[ToolBridge.pickField(props, F_PATH)] = p.search_directory;
+        }
+        if (p.case_insensitive && ToolBridge.hasField(props, ["-i", "case_insensitive", "ignore_case", "ignoreCase", "i"])) {
+          out[ToolBridge.pickField(props, ["-i", "case_insensitive", "ignore_case", "ignoreCase", "i"])] = true;
+        }
+        return JSON.stringify(ToolBridge.prune(out, props));
       }
       // Bash-emulation: real `grep -rn` matches what the upstream tool
       // schema expects (line numbers + path + match, recursive into dir).
