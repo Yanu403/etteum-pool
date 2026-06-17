@@ -47,7 +47,7 @@ import {
   type ServerAction,
   type ServerMessage,
 } from "./protocol";
-import { ToolBridge } from "./tools";
+import { ToolBridge, detectCwdCommand, resolveToolPaths } from "./tools";
 import { creditsPerCall } from "./credits";
 import {
   type DeltaEvent,
@@ -60,7 +60,6 @@ import {
   touchSessionByWs,
 } from "./sessions";
 import { config } from "../../../config";
-
 // ─── Stored shapes ───────────────────────────────────────────────────────────
 
 interface DuoStoredTokens {
@@ -724,7 +723,7 @@ export class GitlabDuoProvider extends BaseProvider {
       return { success: false, error: `openSocket: ${errMsg(e)}`, ...this.classifyError(e) };
     }
 
-    const promise = this.collectTurn(ws, workflowId, request, /* sendStart */ true);
+    const promise = this.collectTurn(ws, workflowId, request, /* sendStart */ true, undefined, undefined, undefined, 0, new Set(), undefined);
     return this.toOneShotResult(promise, request, modelRef);
   }
 
@@ -748,7 +747,7 @@ export class GitlabDuoProvider extends BaseProvider {
       return { success: false, error: `openSocket: ${errMsg(e)}`, ...this.classifyError(e) };
     }
 
-    return this.toStreamResult(ws, workflowId, request, modelRef, /* sendStart */ true);
+    return this.toStreamResult(ws, workflowId, request, modelRef, /* sendStart */ true, undefined, undefined, 0, new Set(), undefined);
   }
 
   // ─── Continuation path (tool_result echo) ───────────────────────────────
@@ -862,7 +861,7 @@ export class GitlabDuoProvider extends BaseProvider {
     const promise = this.collectTurn(
       ws, workflowId, request, /* sendStart */ false, /* actionResponse */ undefined,
       /* onDelta */ undefined, /* actionResponses */ cont.results,
-      priorAgentCount, priorEmittedTexts,
+      priorAgentCount, priorEmittedTexts, cont.session.session,
     );
     // The tool_use we previously registered is now "consumed" — caller is free
     // to drop it; new tool_calls (if any) will be re-registered in toOneShotResult.
@@ -889,7 +888,7 @@ export class GitlabDuoProvider extends BaseProvider {
     return this.toStreamResult(
       ws, workflowId, request, modelRef, /* sendStart */ false,
       /* actionResponse */ undefined, /* actionResponses */ cont.results,
-      priorAgentCount, priorEmittedTexts,
+      priorAgentCount, priorEmittedTexts, cont.session.session,
     );
   }
 
@@ -1041,6 +1040,8 @@ export class GitlabDuoProvider extends BaseProvider {
      *  unreliable. Content-based dedup is robust because a completed
      *  agent message has a fixed final string. */
     priorEmittedTexts: Set<string> = new Set(),
+    /** Session object for working directory tracking. */
+    session?: any,
   ): Promise<TurnResult> {
     return new Promise<TurnResult>((resolve, reject) => {
       let cumulative = "";
@@ -1155,6 +1156,33 @@ export class GitlabDuoProvider extends BaseProvider {
             );
           }
           if (matched) {
+            // Resolve paths and track working directory changes
+            let argsJson = matched.argsJson;
+            
+            // Check if this is a shell command and detect cd
+            if (matched.name.toLowerCase().includes("bash") || 
+                matched.name.toLowerCase().includes("shell") ||
+                matched.name.toLowerCase().includes("terminal")) {
+              try {
+                const args = JSON.parse(argsJson);
+                const command = args.command || args.cmd || "";
+                
+                // Detect cd command and update session working directory
+                const newCwd = detectCwdCommand(command, session?.workingDirectory || process.cwd());
+                if (newCwd && session) {
+                  session.workingDirectory = newCwd;
+                  if (config.gitlabDuoLogToolBridge) {
+                    console.warn(`[gitlab-duo] working directory changed to: ${newCwd}`);
+                  }
+                }
+              } catch {
+                // Ignore JSON parse errors
+              }
+            }
+            
+            // Resolve relative paths to absolute paths
+            argsJson = resolveToolPaths(argsJson, matched.name, session?.workingDirectory || process.cwd());
+            
             toolCall = {
               // OpenAI-native ID prefix. The OpenAI tool-calling spec treats
               // `tool_calls[].id` as an opaque string, but several strict
@@ -1167,7 +1195,7 @@ export class GitlabDuoProvider extends BaseProvider {
               // free to change — round-trip stays intact.
               id: `call_${cryptoRandom()}`,
               name: matched.name,
-              argsJson: matched.argsJson,
+              argsJson: argsJson,
               requestID: matched.requestID,
             };
             return finish("tool");
@@ -1535,6 +1563,9 @@ export class GitlabDuoProvider extends BaseProvider {
       // we'll surface the timeout instead of hanging the SSE forever.
       armTurnIdle();
 
+      // Extract MCP tools from client's tool list (format: server__tool)
+      const mcpTools = this.extractMcpTools(request);
+
       // Send the kickoff frame.
       try {
         if (sendStart) {
@@ -1547,7 +1578,7 @@ export class GitlabDuoProvider extends BaseProvider {
               workflowMetadata: JSON.stringify({ extended_logging: false }),
               additional_context: this.buildAdditionalContext(request),
               clientCapabilities: CLIENT_CAPABILITIES,
-              mcpTools: [],
+              mcpTools: mcpTools,
               preapproved_tools: [],
               flowConfig: undefined,
               flowConfigSchemaVersion: undefined,
@@ -1590,8 +1621,13 @@ export class GitlabDuoProvider extends BaseProvider {
    *  `Bash(mkdir -p foo) → ok`) rather than verbose `[ToolUse toolu_xxx]`
    *  blocks the model has to parse. */
   private buildGoal(request: ChatCompletionRequest): string {
+    // Extract system messages — integrate into goal as user instructions,
+    // NOT as additional_context user_rule (which makes agent restrictive).
+    const systemMessages = (request.messages ?? []).filter((m) => m.role === "system");
+    const systemText = systemMessages.map((m) => this.extractText(m)).filter(Boolean).join("\n\n");
+
     const messages = (request.messages ?? []).filter((m) => m.role !== "system");
-    if (messages.length === 0) return "Continue.";
+    if (messages.length === 0 && !systemText) return "Continue.";
 
     // Find the *latest* user message — that's the actual goal. Everything
     // before it is history.
@@ -1612,11 +1648,21 @@ export class GitlabDuoProvider extends BaseProvider {
     if (lastUserIdx === -1) lastUserIdx = messages.length - 1;
 
     const history = messages.slice(0, lastUserIdx);
-    const latest = messages[lastUserIdx]!;
-    const latestText = this.extractText(latest);
+    const latest = messages[lastUserIdx];
+    const latestText = latest ? this.extractText(latest) : "";
+
+    // Build goal with system prompt integrated as instructions (not restrictions)
+    const goalParts: string[] = [];
+
+    if (systemText) {
+      goalParts.push("IMPORTANT INSTRUCTIONS:");
+      goalParts.push(systemText);
+      goalParts.push("");
+    }
 
     if (history.length === 0) {
-      return latestText || "Continue.";
+      goalParts.push(latestText || "Continue.");
+      return goalParts.join("\n");
     }
 
     const historyLines: string[] = [];
@@ -1666,7 +1712,10 @@ export class GitlabDuoProvider extends BaseProvider {
       }
     }
 
-    if (historyLines.length === 0) return latestText || "Continue.";
+    if (historyLines.length === 0) {
+      goalParts.push(latestText || "Continue.");
+      return goalParts.join("\n");
+    }
 
     // GitLab caps `goal` at 16384 characters server-side. We reserve ~2KB for
     // the latest message + framing and trim the *oldest* history lines first
@@ -1674,7 +1723,7 @@ export class GitlabDuoProvider extends BaseProvider {
     // breadcrumb so the model knows it didn't get the full history.
     const HARD_CAP = 16000;             // safety margin under server's 16384
     const RESERVE = 2000;               // for latest text + headers + footer
-    const HISTORY_BUDGET = HARD_CAP - RESERVE - (latestText.length || 0);
+    const HISTORY_BUDGET = HARD_CAP - RESERVE - (latestText.length || 0) - goalParts.join("\n").length;
 
     let totalLen = 0;
     const kept: string[] = [];
@@ -1693,14 +1742,14 @@ export class GitlabDuoProvider extends BaseProvider {
       kept.unshift(`(${dropped} earlier turn${dropped === 1 ? "" : "s"} omitted to fit the goal length limit)`);
     }
 
-    return [
-      "--- CONVERSATION HISTORY (already executed; do NOT redo these steps, do NOT repeat earlier text) ---",
-      ...kept,
-      "--- END HISTORY ---",
-      "",
-      `Continue from where the conversation left off. The user's latest message:`,
-      latestText || "(continue)",
-    ].join("\n");
+    goalParts.push("--- CONVERSATION HISTORY (already executed; do NOT redo these steps, do NOT repeat earlier text) ---");
+    goalParts.push(...kept);
+    goalParts.push("--- END HISTORY ---");
+    goalParts.push("");
+    goalParts.push(`Continue from where the conversation left off. The user's latest message:`);
+    goalParts.push(latestText || "(continue)");
+
+    return goalParts.join("\n");
   }
 
   /** Extract a flat text body from one message (string or content blocks). */
@@ -1720,26 +1769,67 @@ export class GitlabDuoProvider extends BaseProvider {
     return "";
   }
 
-  /** Forward the `system` message (if any) as a `user_rule` context entry —
-   *  the agentic flow respects user rules natively (analysis doc Phase 3). */
-  private buildAdditionalContext(request: ChatCompletionRequest): AdditionalContextEntry[] {
-    const out: AdditionalContextEntry[] = [];
-    const sys = (request.messages ?? []).filter((m) => m.role === "system");
-    for (const s of sys) {
-      const text = typeof s.content === "string"
-        ? s.content
-        : Array.isArray(s.content)
-          ? s.content.map((b: any) => (b?.type === "text" ? (b.text ?? "") : "")).filter(Boolean).join("\n")
-          : "";
-      if (!text) continue;
-      out.push({
-        category: "user_rule",
-        id: `client-system-${out.length}`,
-        content: text,
-        metadata: {},
+  /** Forward the `system` message (if any) — but NOT as `user_rule` context.
+   *
+   *  WHY: GitLab Duo interprets `user_rule` as "restrictions that limit what
+   *  I can do", making the agent overly cautious, self-identify as "GitLab Duo",
+   *  and refuse tasks. gitlab2api sends `additional_context: []` (empty) and
+   *  merges system messages into the `goal` string instead.
+   *
+   *  Strategy: integrate system prompt into `goal` via `buildGoal()`, NOT as
+   *  `additional_context`. This makes the agent treat it as user instructions,
+   *  not restrictions.
+   */
+  private buildAdditionalContext(_request: ChatCompletionRequest): AdditionalContextEntry[] {
+    // Return empty array — system messages are integrated into goal, not sent
+    // as user_rule context (which makes the agent restrictive/self-limiting).
+    return [];
+  }
+
+  /** Extract MCP tools from client's tool list and format for GitLab Duo.
+   *
+   *  MCP tools follow the naming convention: `server__tool` (double underscore).
+   *  GitLab Duo expects mcpTools in this format:
+   *    { server: string, tool: string, inputSchema?: object }
+   *
+   *  By advertising these tools, the GitLab Duo agent knows they exist and
+   *  can emit `runMCPCall` actions that ToolBridge will forward to the client.
+   */
+  private extractMcpTools(request: ChatCompletionRequest): unknown[] {
+    if (!request.tools || !Array.isArray(request.tools)) return [];
+
+    const mcpTools: unknown[] = [];
+
+    for (const tool of request.tools) {
+      // OpenAI format: { type: "function", function: { name, description, parameters } }
+      // Anthropic format: { name, description, input_schema }
+      const fn = (tool as any)?.function ?? tool;
+      const name = fn?.name;
+
+      // MCP tools use double underscore: server__tool
+      if (!name || !name.includes("__")) continue;
+
+      const parts = name.split("__");
+      if (parts.length < 2) continue;
+
+      const server = parts[0];
+      const toolName = parts.slice(1).join("__"); // tool name might have __
+
+      mcpTools.push({
+        server,
+        tool: toolName,
+        inputSchema: fn?.parameters ?? fn?.input_schema ?? { type: "object", properties: {} },
       });
     }
-    return out;
+
+    if (mcpTools.length > 0) {
+      console.log(
+        `[gitlab-duo] Registered ${mcpTools.length} MCP tools:`,
+        mcpTools.map((t: any) => `${t.server}__${t.tool}`),
+      );
+    }
+
+    return mcpTools;
   }
 
   // ─── Result shaping ──────────────────────────────────────────────────────
@@ -1855,6 +1945,7 @@ export class GitlabDuoProvider extends BaseProvider {
     actionResponses?: Array<{ requestID: string; text: string; isError: boolean }>,
     priorAgentCount = 0,
     priorEmittedTexts: Set<string> = new Set(),
+    session?: any,
   ): Promise<ProviderResult> {
     const id = this.generateId();
     const created = NOW_S();
@@ -1923,7 +2014,7 @@ export class GitlabDuoProvider extends BaseProvider {
         try {
           const turn = await provider.collectTurn(
             ws, workflowId, request, sendStart, actionResponse, onDelta, actionResponses,
-            priorAgentCount, priorEmittedTexts,
+            priorAgentCount, priorEmittedTexts, session,
           );
 
           // Safety net: the final `turn.content` is the authoritative full

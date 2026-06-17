@@ -20,6 +20,94 @@
  */
 
 import type { ServerAction } from "./protocol";
+import path from "path";
+
+/**
+ * Resolve a path to absolute using the given working directory.
+ * If the path is already absolute, returns it as-is.
+ * If relative, resolves it against the working directory.
+ */
+export function resolvePath(p: string, cwd: string): string {
+  if (!p || path.isAbsolute(p)) return p;
+  return path.resolve(cwd, p);
+}
+
+/**
+ * Detect `cd` commands in shell actions and extract the target directory.
+ * Returns the new working directory if a cd command is detected, otherwise null.
+ * 
+ * Handles common patterns:
+ * - `cd /path/to/dir`
+ * - `cd path/to/dir`
+ * - `cd path && other commands`
+ * - `cd path ; other commands`
+ */
+export function detectCwdCommand(command: string, currentCwd: string): string | null {
+  if (!command || !command.trim()) return null;
+  
+  // Handle quoted paths: cd "path with space" or cd 'path with space'
+  const quotedPattern = /\bcd\s+(["'])([^"']+)\1/;
+  const quotedMatch = command.match(quotedPattern);
+  
+  if (quotedMatch && quotedMatch[2]) {
+    const targetDir = quotedMatch[2];
+    const resolved = resolvePath(targetDir, currentCwd);
+    if (!resolved.startsWith('-')) {
+      return resolved;
+    }
+  }
+  
+  // Handle unquoted paths: cd path (no space allowed)
+  const unquotedPattern = /\bcd\s+([^'"\s;&&]+)/;
+  const unquotedMatch = command.match(unquotedPattern);
+  
+  if (!unquotedMatch || !unquotedMatch[1]) return null;
+  
+  const targetDir = unquotedMatch[1];
+  const resolved = resolvePath(targetDir, currentCwd);
+  
+  // Validate it's not something that looks like a flag or option
+  if (resolved.startsWith('-')) return null;
+  
+  return resolved;
+}
+
+/**
+ * Apply path resolution to tool arguments.
+ * Resolves relative paths in filepath/path/file fields to absolute paths.
+ */
+export function resolveToolPaths(
+  argsJson: string,
+  toolName: string,
+  cwd: string
+): string {
+  if (!argsJson || !cwd) return argsJson;
+  
+  try {
+    const args = JSON.parse(argsJson);
+    if (!args || typeof args !== 'object') return argsJson;
+    
+    // Fields that typically contain file paths
+    const pathFields = ['filepath', 'path', 'file', 'directory', 'directory_path'];
+    
+    let modified = false;
+    for (const field of pathFields) {
+      if (args[field] && typeof args[field] === 'string') {
+        const original = args[field];
+        const resolved = resolvePath(original, cwd);
+        if (resolved !== original) {
+          args[field] = resolved;
+          modified = true;
+        }
+      }
+    }
+    
+    return modified ? JSON.stringify(args) : argsJson;
+  } catch {
+    // If JSON parsing fails, return original
+    return argsJson;
+  }
+}
 
 /** Subset of JSON Schema we need to look up declared property names. */
 interface ToolSchema {
@@ -49,7 +137,12 @@ export interface MatchedToolCall {
 }
 
 export class ToolBridge {
-  /** Heuristic candidates for each Duo action. First match wins. */
+  /** Heuristic candidates for each Duo action. First match wins.
+   *
+   *  IMPORTANT: Avoid generic terms like "search" that could match multiple
+   *  action types. Use specific tool names only (e.g. "grep" not "search").
+   *  The looseMatch() fallback handles substring matching with word boundaries.
+   */
   private static readonly CANDIDATES: Record<string, string[]> = {
     runCommand: ["bash", "shell", "run_command", "execute_command", "terminal", "command"],
     runShellCommand: ["bash", "shell", "run_shell", "run_command", "execute_command", "terminal"],
@@ -60,20 +153,18 @@ export class ToolBridge {
     mkdir: ["mkdir", "make_directory", "create_directory"],
     listDirectory: ["ls", "list_dir", "list_directory", "fs_list", "tree"],
     findFiles: ["glob", "find_files", "find", "fs_find"],
-    grep: ["grep", "search", "fs_grep", "ripgrep"],
-    runGrep: ["grep", "search", "fs_grep", "ripgrep"],
+    // ❌ REMOVED "search" — too generic, overlaps with web_search/file_search
+    grep: ["grep", "fs_grep", "ripgrep", "rg"],
+    runGrep: ["grep", "fs_grep", "ripgrep", "rg"],
     scanDirectoryTree: ["tree", "scan_directory", "list_directory", "ls"],
     runGitCommand: ["bash", "shell", "git", "run_command", "execute_command"],
     runReadOnlyGitCommand: ["bash", "shell", "git", "run_command", "execute_command"],
     runHTTPRequest: ["fetch", "http", "http_request", "web_fetch", "curl"],
     // ── Newer Duo agentic actions (17.x+) ────────────────────────────────────
-    // Web search: prefer a real web-search tool if the client has one, else
-    // fall back to fetch (we'll send the query as a search-engine URL).
-    runWebSearch: ["web_search", "websearch", "search_web", "google_search"],
-    // Semantic / RAG file search: most clients only have grep/glob, so we
-    // route to those by default and let argsFor() degrade the query into a
-    // simple regex/glob pattern.
-    runFileSearch: ["file_search", "fs_search", "semantic_search", "grep", "search", "ripgrep"],
+    // Web search: explicit web-prefixed names only, no generic "search"
+    runWebSearch: ["web_search", "websearch", "search_web", "google_search", "internet_search"],
+    // Semantic / RAG file search: specific names only, no overlap with grep
+    runFileSearch: ["file_search", "fs_search", "semantic_search", "codebase_search"],
     // MCP tool calls: route by the upstream `tool` name when the client
     // declared an MCP-style namespaced tool (e.g. "github__create_issue"),
     // otherwise we emit the bare tool name and hope the client recognizes it.
@@ -281,7 +372,21 @@ export class ToolBridge {
    *  "KillShell", "bash" matches "BashOutput", etc. — silently routing an
    *  action to the wrong tool. We instead require the candidate to appear at
    *  a token boundary (start/end of name, or delimited by `_`/`-`/case
-   *  change). Candidates ≤ 2 chars (e.g. "ls") must match a whole token. */
+   *  change). Candidates ≤ 3 chars (e.g. "ls") must match a whole token
+   *  EXACTLY — no substring matching at all.
+   *
+   *  CRITICAL: short generic words like "search" must NEVER match compound
+   *  tool names like "web_search" or "file_search" because that would route
+   *  grep actions to web-search tools. We enforce this by requiring the
+   *  candidate to be a FULL token — `web_search` splits into ["web","search"]
+   *  and "search" IS a full token there, so we add an extra check: for
+   *  candidates that are common suffixes in compound names, require the
+   *  declared name to BE the candidate (case-insensitive), not just contain it.
+   */
+  private static readonly COMPOUND_SUFFIXES = new Set([
+    "search", "read", "write", "edit", "command", "fetch", "list",
+  ]);
+
   private static looseMatch(declared: string, candidate: string): boolean {
     const d = declared.toLowerCase();
     const c = candidate.toLowerCase();
@@ -293,10 +398,17 @@ export class ToolBridge {
       .split(/[\s_\-]+/)
       .map((t) => t.toLowerCase())
       .filter(Boolean);
-    if (tokens.includes(c)) return true;
-    // For longer candidates, allow a substring within a single token
-    // (e.g. "command" inside "runcommandtool") — but never for ≤ 2 chars.
-    if (c.length <= 2) return false;
+    if (!tokens.includes(c)) return false;
+    // Compound suffix guard: "search" is a full token in "web_search" and
+    // "file_search", but we must NOT match grep/runGrep candidates to those
+    // tools. If the candidate is a known compound suffix AND the declared
+    // name has more than one token, require the candidate to be the ONLY
+    // token (i.e. the tool is literally called "search", not "web_search").
+    if (ToolBridge.COMPOUND_SUFFIXES.has(c) && tokens.length > 1) return false;
+    // For very short candidates (≤ 2 chars), exact-token match is already
+    // enforced above — no further substring needed.
+    if (c.length <= 2) return true;
+    // For longer candidates, allow substring within a single token.
     return tokens.some((t) => t.includes(c));
   }
 
@@ -489,7 +601,20 @@ export class ToolBridge {
         const out: Record<string, unknown> = {
           [ToolBridge.pickField(props, F_PATH)]: p.filepath,
         };
-        if (p.lineOffset) out[ToolBridge.pickField(props, F_OFFSET)] = p.lineOffset;
+        // Always forward offset and limit (best practice: don't skip based on schema)
+        const F_OFFSET_EXTENDED = ["offset", "line_offset", "lineOffset", "start_line", "startLine"];
+        const F_LIMIT = ["limit", "length", "chunk_size", "chunkSize", "num_lines", "numLines"];
+        
+        // offset (1-indexed start line)
+        if (p.lineOffset !== undefined) {
+          out[ToolBridge.pickField(props, F_OFFSET_EXTENDED)] = p.lineOffset;
+        }
+        
+        // limit (number of lines to read)
+        if (p.chunkSize !== undefined) {
+          out[ToolBridge.pickField(props, F_LIMIT)] = p.chunkSize;
+        }
+        
         return JSON.stringify(out);
       }
       // Bash-emulation: when the client only declared Bash, use `cat` (or
@@ -497,9 +622,16 @@ export class ToolBridge {
       // runReadFile would emit `{filepath:..., lineOffset:...}` to a tool
       // that expects `{command: "..."}` and the call would fail silently.
       if (lower.includes("bash") || lower.includes("shell") || lower === "terminal") {
-        const cmd = p.lineOffset
-          ? `sed -n '${Number(p.lineOffset)},$p' ${shellQuote(p.filepath)}`
-          : `cat ${shellQuote(p.filepath)}`;
+        let cmd: string;
+        if (p.lineOffset && p.chunkSize) {
+          // sed -n 'start,endp' for specific line range
+          const endLine = p.lineOffset + p.chunkSize - 1;
+          cmd = `sed -n '${p.lineOffset},${endLine}p' ${shellQuote(p.filepath)}`;
+        } else if (p.lineOffset) {
+          cmd = `sed -n '${Number(p.lineOffset)},$p' ${shellQuote(p.filepath)}`;
+        } else {
+          cmd = `cat ${shellQuote(p.filepath)}`;
+        }
         return JSON.stringify({ [ToolBridge.pickField(props, F_CMD)]: cmd });
       }
       return JSON.stringify(payload);

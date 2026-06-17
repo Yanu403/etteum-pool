@@ -13,7 +13,10 @@
 
 // ─── Constants pulled from the bundle ────────────────────────────────────────
 
-/** clientCapabilities @8239799 — the seven flags the official CLI advertises. */
+/** clientCapabilities @8239799 — the seven flags the official CLI advertises.
+ *  We include ALL capabilities so the agent knows it has full access.
+ *  Even if a capability isn't actually used, advertising it prevents the
+ *  agent from self-limiting ("I don't have web search access" etc). */
 export const CLIENT_CAPABILITIES: readonly string[] = [
   "shell_command",
   "read_file_chunked",
@@ -22,6 +25,9 @@ export const CLIENT_CAPABILITIES: readonly string[] = [
   "command_timeout",
   "web_search",
   "incremental_streaming",
+  "file_modifications",
+  "git_operations",
+  "mcp_tools",
 ] as const;
 
 /**
@@ -46,8 +52,11 @@ export const WORKFLOW_DEFINITION_AGENTIC = "chat";
 /** Agent privileges — see plans/gitlab-duo-tool-bridge.md.
  *  1 = read_write_files, 2 = read_only_gitlab, 3 = read_write_gitlab,
  *  4 = run_commands, 5 = run_mcp_tools, 6 = use_git.
- *  We omit 5 (MCP) because it requires a per-namespace `mcp_enabled` flag. */
-export const AGENT_PRIVILEGES: readonly number[] = [1, 2, 3, 4, 6] as const;
+ *  We include ALL privileges (1-6) so the agent knows it has full access.
+ *  MCP (5) is included even though we don't register MCP servers — the
+ *  agent will just see "no MCP tools available" but won't self-limit other
+ *  capabilities. Omitting it makes the agent overly restrictive. */
+export const AGENT_PRIVILEGES: readonly number[] = [1, 2, 3, 4, 5, 6] as const;
 
 export const CLIENT_VERSION = "1.0";
 

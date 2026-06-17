@@ -82,6 +82,12 @@ export interface DuoSession {
    * unique evolving content, so they always slip through.
    */
   emittedAgentTexts: Set<string>;
+  /**
+   * Current working directory for this session. Tracked to resolve relative
+   * paths to absolute paths before forwarding tool calls to the client.
+   * Updated when we detect `cd` commands in shell actions.
+   */
+  workingDirectory: string;
 }
 
 interface SessionStore {
@@ -150,6 +156,7 @@ export function registerSession(
     ...(toolCallIdToRequestId ? { toolCallIdToRequestId } : {}),
     agentMessageCount,
     emittedAgentTexts: carriedTexts,
+    workingDirectory: process.cwd(),
   };
   for (const id of toolUseIds) store.byToolUseId.set(id, session);
   return session;
