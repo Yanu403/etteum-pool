@@ -249,7 +249,11 @@ if (!directAccessResponse.ok) {
   process.exit(1);
 }
 
-const directAccess = await directAccessResponse.json();
+interface DirectAccessResponse {
+  server_capabilities?: string[];
+}
+
+const directAccess = await directAccessResponse.json() as DirectAccessResponse;
 console.log(`✅ Got direct_access credentials`);
 console.log(`   Server capabilities: ${directAccess.server_capabilities?.join(", ") || "none"}`);
 

@@ -120,10 +120,12 @@ interface ToolSchema {
  *  `input_schema`/`parameters`) or OpenAI (nested `function.name` +
  *  `function.parameters`) wire format. `normalizeTools()` flattens both. */
 interface ClientTool {
+  type?: string;
   name?: string;
+  description?: string;
   input_schema?: ToolSchema;
   parameters?: ToolSchema;
-  function?: { name?: string; parameters?: ToolSchema };
+  function?: { name?: string; description?: string; parameters?: ToolSchema };
 }
 
 export interface MatchedToolCall {

@@ -135,18 +135,22 @@ export async function routeRequest(
   // Try up to 3 accounts before giving up
   const maxRetries = 3;
   let lastError = "";
+  const attemptedByokAccountIds = new Set<number>();
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     // BYOK uses prefix-based account lookup (not the generic pool),
     // so it can also find error-status accounts and retry them.
     const account = providerName === "byok"
-      ? (await pool.getAccountForModel(compressedRequest.model))?.account ?? null
+      ? (await pool.getAccountForModel(compressedRequest.model, {
+          excludeAccountIds: attemptedByokAccountIds,
+        }))?.account ?? null
       : await pool.getNextAccount(providerName);
     if (!account) {
       throw new Error(
         `No active accounts available for provider: ${providerName}`
       );
     }
+    if (providerName === "byok") attemptedByokAccountIds.add(account.id);
 
     const startTime = Date.now();
     let tracked = false;

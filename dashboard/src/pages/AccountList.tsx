@@ -21,7 +21,7 @@ import {
   warmupAllAccounts,
 } from "@/lib/api";
 
-type Provider = "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder";
+type Provider = "kiro" | "kiro-pro" | "codebuddy" | "codebuddy-china" | "canva" | "codex" | "qoder";
 type Status = "active" | "exhausted" | "error" | "pending" | "disabled";
 
 interface CodexQuotaWindow {
@@ -106,7 +106,9 @@ const statusVariants: Record<string, "success" | "warning" | "error" | "secondar
 };
 
 function labelProvider(provider: string) {
-  return provider === "codebuddy" ? "CodeBuddy" : provider.charAt(0).toUpperCase() + provider.slice(1);
+  if (provider === "codebuddy") return "CodeBuddy";
+  if (provider === "codebuddy-china") return "CodeBuddy CN";
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 
 function formatCredit(value?: number | null) {

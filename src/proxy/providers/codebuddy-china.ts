@@ -547,7 +547,7 @@ export class CodeBuddyChinaProvider extends BaseProvider {
     }
 
     // Fallback: validate via chat completions endpoint
-    const apiStatus = await this.validateApiKey(tokens);
+    const apiStatus = await this.validateApiKey(tokens || {} as CodeBuddyChinaTokens);
 
     if (apiStatus === "ok") {
       // API works but billing failed (transient) — report as healthy with stored quota

@@ -1190,6 +1190,7 @@ accountsRouter.post("/", async (c) => {
     password?: string;
     personalToken?: string;
     apiKey?: string; // YouMind sk-ym-... key
+    apiKeys?: string; // CodeBuddy China bulk: newline-separated ck_... keys
     tokens?: Record<string, unknown>;
     status?: "active" | "pending";
     browserEngine?: string;
@@ -1325,7 +1326,7 @@ accountsRouter.post("/", async (c) => {
       .then((rows) => rows.length);
 
     for (let i = 0; i < keys.length; i++) {
-      const key = keys[i];
+      const key = keys[i]!;
       const email = `cbc-account-${existingCount + i + 1}`;
       const encryptedKey = encrypt(key);
 

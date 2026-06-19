@@ -87,3 +87,9 @@ services/windsurf-api/
 # Local artifacts
 poolprox.db
 test-compat.out
+
+# Local test/debug scripts at project root (not part of the proxy)
+/test-*.ts
+/test-*.sh
+/test-*.mjs
+/test-*.js

@@ -757,6 +757,18 @@ export async function completeCodexOAuthCallbackUrl(callbackUrl: string) {
 }
 
 // BYOK (Bring Your Own Key) API functions
+export interface ByokKeyInfo {
+  id?: number;
+  label: string;
+  key?: string;
+  status?: string;
+  enabled?: boolean;
+  weight?: number;
+  priority?: number;
+  lastUsedAt?: string | null;
+  errorMessage?: string | null;
+}
+
 export interface ByokProvider {
   id: number;
   label: string;
@@ -768,6 +780,10 @@ export interface ByokProvider {
   status: string;
   enabled: boolean;
   available_models?: string[];
+  load_balancing_method?: "round_robin" | "sequential" | "least_inflight";
+  key_count?: number;
+  active_key_count?: number;
+  keys?: ByokKeyInfo[];
 }
 
 export async function fetchByokProviders(): Promise<{ providers: ByokProvider[] }> {
@@ -777,11 +793,13 @@ export async function fetchByokProviders(): Promise<{ providers: ByokProvider[] 
 export async function createByokProvider(data: {
   label: string;
   base_url: string;
-  api_key: string;
+  api_key?: string;
+  api_keys?: ByokKeyInfo[];
   format?: "openai" | "anthropic" | "auto";
   models: string[];
   headers?: Record<string, string>;
-}): Promise<{ success: boolean; id: number; label: string; models: string[] }> {
+  load_balancing_method?: "round_robin" | "sequential" | "least_inflight";
+}): Promise<{ success: boolean; id: number; label: string; models: string[]; key_count?: number }> {
   return fetchApi("/api/accounts/byok", {
     method: "POST",
     body: JSON.stringify(data),
@@ -793,9 +811,11 @@ export async function updateByokProvider(
   data: {
     base_url?: string;
     api_key?: string;
+    api_keys?: ByokKeyInfo[];
     format?: "openai" | "anthropic" | "auto";
     models?: string[];
     headers?: Record<string, string>;
+    load_balancing_method?: "round_robin" | "sequential" | "least_inflight";
   }
 ): Promise<{ success: boolean; id: number; label: string; models: string[] }> {
   return fetchApi(`/api/accounts/byok/${id}`, {
@@ -806,6 +826,12 @@ export async function updateByokProvider(
 
 export async function deleteByokProvider(id: number): Promise<{ success: boolean; deleted: number }> {
   return fetchApi(`/api/accounts/byok/${id}`, { method: "DELETE" });
+}
+
+export async function revealByokKey(
+  id: number
+): Promise<{ success: boolean; id: number; label: string; key: string }> {
+  return fetchApi(`/api/accounts/byok/${id}/reveal`, { method: "POST" });
 }
 
 export async function testByokProvider(

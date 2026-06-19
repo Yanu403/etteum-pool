@@ -25,7 +25,12 @@ class AccountPool {
 
   private activeAccountsCache = new Map<ProviderName, ActiveAccountsCacheEntry>();
   private inFlightByAccountId = new Map<number, number>();
-  private lbMethodCache: { global: string; perProvider: Map<ProviderName, string>; expiresAt: number } | null = null;
+  private lbMethodCache: {
+    global: string;
+    perProvider: Map<ProviderName, string>;
+    perByokPrefix: Map<string, string>;
+    expiresAt: number;
+  } | null = null;
 
   /**
    * Clear cached active accounts after account mutations or status changes.
@@ -39,12 +44,13 @@ class AccountPool {
     this.activeAccountsCache.clear();
   }
 
-  private async getLoadBalancingMethod(provider: ProviderName): Promise<string> {
+  async getLoadBalancingMethod(provider: ProviderName): Promise<string> {
     const now = Date.now();
     if (!this.lbMethodCache || this.lbMethodCache.expiresAt <= now) {
       try {
         const rows = await db.select().from(settings);
         const perProvider = new Map<ProviderName, string>();
+        const perByokPrefix = new Map<string, string>();
         let global = "round_robin";
         for (const row of rows) {
           if (!row.value) continue;
@@ -52,15 +58,33 @@ class AccountPool {
             global = row.value;
             continue;
           }
+          const byokMatch = row.key.match(/^byok_(.+)_lb_method$/);
+          if (byokMatch && byokMatch[1]) {
+            perByokPrefix.set(byokMatch[1], row.value);
+            continue;
+          }
           const match = row.key.match(/^provider_(.+)_lb_method$/);
           if (match && match[1]) perProvider.set(match[1] as ProviderName, row.value);
         }
-        this.lbMethodCache = { global, perProvider, expiresAt: now + 10000 };
+        this.lbMethodCache = { global, perProvider, perByokPrefix, expiresAt: now + 10000 };
       } catch {
-        this.lbMethodCache = { global: "round_robin", perProvider: new Map(), expiresAt: now + 10000 };
+        this.lbMethodCache = {
+          global: "round_robin",
+          perProvider: new Map(),
+          perByokPrefix: new Map(),
+          expiresAt: now + 10000,
+        };
       }
     }
-    return this.lbMethodCache.perProvider.get(provider) || this.lbMethodCache.global;
+    return this.lbMethodCache?.perProvider.get(provider) || this.lbMethodCache?.global || "round_robin";
+  }
+
+  async getByokLoadBalancingMethod(prefix: string): Promise<string> {
+    await this.getLoadBalancingMethod("byok");
+    return this.lbMethodCache?.perByokPrefix.get(prefix)
+      || this.lbMethodCache?.perProvider.get("byok")
+      || this.lbMethodCache?.global
+      || "round_robin";
   }
 
   invalidateLoadBalancingCache(): void {
@@ -110,7 +134,7 @@ class AccountPool {
     return selected || null;
   }
 
-  private getInFlightCount(accountId: number): number {
+  getInFlightCount(accountId: number): number {
     return this.inFlightByAccountId.get(accountId) || 0;
   }
 
@@ -313,7 +337,10 @@ class AccountPool {
   /**
    * Get any available account across all providers that support the model.
    */
-  async getAccountForModel(model: string): Promise<{ account: Account; provider: ProviderName } | null> {
+  async getAccountForModel(
+    model: string,
+    options: { excludeAccountIds?: Set<number> } = {}
+  ): Promise<{ account: Account; provider: ProviderName } | null> {
     // Determine which provider handles this model
     const provider = this.getProviderForModel(model);
     if (!provider) return null;
@@ -322,7 +349,12 @@ class AccountPool {
     if (provider === "byok") {
       const { getByokProvider } = await import("./providers/registry");
       const byokProvider = getByokProvider();
-      const account = await byokProvider.findAccountForModel(model);
+      const prefix = byokProvider.findPrefixForModel(model);
+      const account = await byokProvider.findAccountForModel(model, {
+        excludeAccountIds: options.excludeAccountIds,
+        loadBalancingMethod: prefix ? await this.getByokLoadBalancingMethod(prefix) : await this.getLoadBalancingMethod("byok"),
+        getInFlightCount: (accountId) => this.getInFlightCount(accountId),
+      });
       if (!account) return null;
       return { account, provider: "byok" };
     }
